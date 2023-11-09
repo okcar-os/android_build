@@ -593,6 +593,8 @@ $(foreach image, \
     RECOVERY, \
   $(eval $(call product-build-image-config,$(image))))
 
+-include okcar/product.mk
+
 product-build-image-config :=
 
 $(call readonly-product-vars)

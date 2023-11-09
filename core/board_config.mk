@@ -239,6 +239,7 @@ endif
 # the product config works on.
 ifndef RBC_BOARD_CONFIG
 include $(board_config_mk)
+-include okcar/after_device_include.mk
 else
   $(shell mkdir -p $(OUT_DIR)/rbc)
   $(call dump-variables-rbc, $(OUT_DIR)/rbc/make_vars_pre_board_config.mk)
