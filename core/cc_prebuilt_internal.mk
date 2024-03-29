@@ -56,9 +56,6 @@ ifneq ($(filter true keep_symbols no_debuglink mini-debug-info,$(my_strip_module
   ifeq ($(filter SHARED_LIBRARIES EXECUTABLES NATIVE_TESTS,$(LOCAL_MODULE_CLASS)),)
     $(call pretty-error,Can strip/pack only shared libraries or executables)
   endif
-  ifneq ($(LOCAL_PREBUILT_STRIP_COMMENTS),)
-    $(call pretty-error,Cannot strip/pack scripts)
-  endif
   # Set the arch-specific variables to set up the strip rules
   LOCAL_STRIP_MODULE_$($(my_prefix)$(LOCAL_2ND_ARCH_VAR_PREFIX)ARCH) := $(my_strip_module)
   include $(BUILD_SYSTEM)/dynamic_binary.mk
@@ -138,6 +135,27 @@ my_shared_libraries := $(strip \
 # Extra shared libraries introduced by LOCAL_CXX_STL (may append some libraries to
 # my_shared_libraries).
 include $(BUILD_SYSTEM)/cxx_stl_setup.mk
+
+# When compiling against API imported module, use API import stub libraries.
+apiimport_postfix := .apiimport
+
+ifneq ($(LOCAL_USE_VNDK),)
+  ifeq ($(LOCAL_USE_VNDK_PRODUCT),true)
+    apiimport_postfix := .apiimport.product
+  else
+    apiimport_postfix := .apiimport.vendor
+  endif
+endif
+
+ifdef my_shared_libraries
+my_shared_libraries := $(foreach l,$(my_shared_libraries), \
+ $(if $(filter $(l), $(API_IMPORTED_SHARED_LIBRARIES)), $(l)$(apiimport_postfix), $(l)))
+endif #my_shared_libraries
+
+ifdef my_system_shared_libraries
+my_system_shared_libraries := $(foreach l,$(my_system_shared_libraries), \
+ $(if $(filter $(l), $(API_IMPORTED_SHARED_LIBRARIES)), $(l)$(apiimport_postfix), $(l)))
+endif #my_system_shared_libraries
 
 ifdef my_shared_libraries
 ifdef LOCAL_USE_VNDK

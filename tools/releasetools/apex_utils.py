@@ -63,6 +63,8 @@ class ApexApkSigner(object):
     self.codename_to_api_level_map = codename_to_api_level_map
     self.debugfs_path = os.path.join(
         OPTIONS.search_path, "bin", "debugfs_static")
+    self.fsckerofs_path = os.path.join(
+        OPTIONS.search_path, "bin", "fsck.erofs")
     self.avbtool = avbtool if avbtool else "avbtool"
     self.sign_tool = sign_tool
 
@@ -80,8 +82,8 @@ class ApexApkSigner(object):
           "Couldn't find location of debugfs_static: " +
           "Path {} does not exist. ".format(self.debugfs_path) +
           "Make sure bin/debugfs_static can be found in -p <path>")
-    list_cmd = ['deapexer', '--debugfs_path',
-                self.debugfs_path, 'list', self.apex_path]
+    list_cmd = ['deapexer', '--debugfs_path', self.debugfs_path,
+                'list', self.apex_path]
     entries_names = common.RunAndCheckOutput(list_cmd).split()
     apk_entries = [name for name in entries_names if name.endswith('.apk')]
 
@@ -116,9 +118,16 @@ class ApexApkSigner(object):
           "Couldn't find location of debugfs_static: " +
           "Path {} does not exist. ".format(self.debugfs_path) +
           "Make sure bin/debugfs_static can be found in -p <path>")
+    if not os.path.exists(self.fsckerofs_path):
+      raise ApexSigningError(
+          "Couldn't find location of fsck.erofs: " +
+          "Path {} does not exist. ".format(self.fsckerofs_path) +
+          "Make sure bin/fsck.erofs can be found in -p <path>")
     payload_dir = common.MakeTempDir()
-    extract_cmd = ['deapexer', '--debugfs_path',
-                   self.debugfs_path, 'extract', self.apex_path, payload_dir]
+    extract_cmd = ['deapexer', '--debugfs_path', self.debugfs_path,
+                   '--fsckerofs_path', self.fsckerofs_path,
+                   'extract',
+                   self.apex_path, payload_dir]
     common.RunAndCheckOutput(extract_cmd)
 
     has_signed_content = False
@@ -559,12 +568,14 @@ def GetApexInfoFromTargetFiles(input_file, partition, compressed_only=True):
   debugfs_path = "debugfs"
   if OPTIONS.search_path:
     debugfs_path = os.path.join(OPTIONS.search_path, "bin", "debugfs_static")
+
   deapexer = 'deapexer'
   if OPTIONS.search_path:
     deapexer_path = os.path.join(OPTIONS.search_path, "bin", "deapexer")
     if os.path.isfile(deapexer_path):
       deapexer = deapexer_path
-  for apex_filename in os.listdir(target_dir):
+
+  for apex_filename in sorted(os.listdir(target_dir)):
     apex_filepath = os.path.join(target_dir, apex_filename)
     if not os.path.isfile(apex_filepath) or \
             not zipfile.is_zipfile(apex_filepath):

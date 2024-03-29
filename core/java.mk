@@ -83,8 +83,6 @@ LOCAL_INTERMEDIATE_TARGETS += \
     $(full_classes_stubs_jar) \
     $(java_source_list_file)
 
-LOCAL_INTERMEDIATE_SOURCE_DIR := $(intermediates.COMMON)/src
-
 ###########################################################
 ## AIDL: Compile .aidl files to .java
 ###########################################################
@@ -200,10 +198,6 @@ ifdef full_classes_jar
 $(eval $(call copy-one-file,$(full_classes_jar),$(full_classes_stubs_jar)))
 ALL_MODULES.$(my_register_name).STUBS := $(full_classes_stubs_jar)
 
-# The layers file allows you to enforce a layering between java packages.
-# Run build/make/tools/java-layers.py for more details.
-layers_file := $(addprefix $(LOCAL_PATH)/, $(LOCAL_JAVA_LAYERS_FILE))
-$(full_classes_compiled_jar): PRIVATE_JAVA_LAYERS_FILE := $(layers_file)
 $(full_classes_compiled_jar): PRIVATE_WARNINGS_ENABLE := $(LOCAL_WARNINGS_ENABLE)
 
 # Compile the java files to a .jar file.
@@ -300,9 +294,7 @@ $(full_classes_combined_jar): PRIVATE_DONT_DELETE_JAR_META_INF := $(LOCAL_DONT_D
 $(full_classes_combined_jar): $(full_classes_compiled_jar) \
                               $(jar_manifest_file) \
                               $(full_static_java_libs) | $(MERGE_ZIPS)
-	$(if $(PRIVATE_JAR_MANIFEST), $(hide) sed -e "s/%BUILD_NUMBER%/$(BUILD_NUMBER_FROM_FILE)/" \
-            $(PRIVATE_JAR_MANIFEST) > $(dir $@)/manifest.mf)
-	$(MERGE_ZIPS) -j --ignore-duplicates $(if $(PRIVATE_JAR_MANIFEST),-m $(dir $@)/manifest.mf) \
+	$(MERGE_ZIPS) -j --ignore-duplicates $(if $(PRIVATE_JAR_MANIFEST),-m $(PRIVATE_JAR_MANIFEST)) \
             $(if $(PRIVATE_DONT_DELETE_JAR_META_INF),,-stripDir META-INF -zipToNotStrip $<) \
             $@ $< $(PRIVATE_STATIC_JAVA_LIBRARIES)
 
@@ -494,13 +486,13 @@ ifdef LOCAL_PROGUARD_ENABLED
   $(built_dex_intermediate): PRIVATE_EXTRA_INPUT_JAR := $(extra_input_jar)
   $(built_dex_intermediate): PRIVATE_PROGUARD_FLAGS := $(legacy_proguard_flags) $(common_proguard_flags) $(LOCAL_PROGUARD_FLAGS)
   $(built_dex_intermediate): PRIVATE_PROGUARD_DICTIONARY := $(proguard_dictionary)
-  $(built_dex_intermediate) : $(full_classes_pre_proguard_jar) $(extra_input_jar) $(my_proguard_sdk_raise) $(common_proguard_flag_files) $(legacy_proguard_lib_deps) $(R8_COMPAT_PROGUARD) $(LOCAL_PROGUARD_FLAGS_DEPS)
+  $(built_dex_intermediate) : $(full_classes_pre_proguard_jar) $(extra_input_jar) $(my_proguard_sdk_raise) $(common_proguard_flag_files) $(legacy_proguard_lib_deps) $(R8) $(LOCAL_PROGUARD_FLAGS_DEPS)
 	$(transform-jar-to-dex-r8)
 else # !LOCAL_PROGUARD_ENABLED
   $(built_dex_intermediate): .KATI_NINJA_POOL := $(D8_NINJA_POOL)
   $(built_dex_intermediate): PRIVATE_D8_LIBS := $(full_java_bootclasspath_libs) $(full_shared_java_header_libs)
   $(built_dex_intermediate): $(full_java_bootclasspath_libs) $(full_shared_java_header_libs)
-  $(built_dex_intermediate): $(full_classes_pre_proguard_jar) $(DX) $(ZIP2ZIP)
+  $(built_dex_intermediate): $(full_classes_pre_proguard_jar) $(D8) $(ZIP2ZIP)
 	$(transform-classes.jar-to-dex)
 endif
 

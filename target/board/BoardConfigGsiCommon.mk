@@ -3,6 +3,8 @@
 # Common compile-time definitions for GSI
 # Builds upon the mainline config.
 #
+# See device/generic/common/README.md for more details.
+#
 
 include build/make/target/board/BoardConfigMainlineCommon.mk
 
@@ -17,6 +19,12 @@ BOARD_SYSTEMIMAGE_FILE_SYSTEM_TYPE := $(GSI_FILE_SYSTEM_TYPE)
 TARGET_USERIMAGES_SPARSE_EXT_DISABLED := true
 TARGET_USERIMAGES_SPARSE_EROFS_DISABLED := true
 
+# Enable system_dlkm image for creating a symlink in GSI to support
+# the devices with system_dlkm partition
+BOARD_USES_SYSTEM_DLKMIMAGE := true
+BOARD_SYSTEM_DLKMIMAGE_FILE_SYSTEM_TYPE := ext4
+TARGET_COPY_OUT_SYSTEM_DLKM := system_dlkm
+
 # GSI also includes make_f2fs to support userdata parition in f2fs
 # for some devices
 TARGET_USERIMAGES_USE_F2FS := true
@@ -28,6 +36,7 @@ BOARD_SYSTEMIMAGE_PARTITION_RESERVED_SIZE := 67108864
 TARGET_COPY_OUT_PRODUCT := system/product
 TARGET_COPY_OUT_SYSTEM_EXT := system/system_ext
 BOARD_PRODUCTIMAGE_FILE_SYSTEM_TYPE :=
+BOARD_SYSTEM_EXTIMAGE_FILE_SYSTEM_TYPE :=
 
 # Creates metadata partition mount point under root for
 # the devices with metadata parition
@@ -80,6 +89,3 @@ BOARD_CACHEIMAGE_PARTITION_SIZE := 16777216
 
 # Setup a vendor image to let PRODUCT_VENDOR_PROPERTIES does not affect GSI
 BOARD_VENDORIMAGE_FILE_SYSTEM_TYPE := ext4
-
-# Disable 64 bit mediadrmserver
-TARGET_ENABLE_MEDIADRM_64 :=

@@ -22,9 +22,15 @@ $(call inherit-product, $(SRC_TARGET_DIR)/product/media_system_ext.mk)
 
 # /system_ext packages
 PRODUCT_PACKAGES += \
+    AccessibilityMenu \
     Launcher3QuickStep \
     Provision \
     Settings \
     StorageManager \
     SystemUI \
     WallpaperCropper \
+
+# Base modules when shipping api level is less than or equal to 34
+PRODUCT_PACKAGES_SHIPPING_API_LEVEL_34 += \
+    hwservicemanager \
+    android.hidl.allocator@1.0-service \

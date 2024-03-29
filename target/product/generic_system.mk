@@ -32,6 +32,7 @@ PRODUCT_PACKAGES += \
 PRODUCT_PACKAGES += \
     LiveWallpapersPicker \
     PartnerBookmarksProvider \
+    preinstalled-packages-platform-generic-system.xml \
     Stk \
     Tag \
 
@@ -67,7 +68,6 @@ PRODUCT_PACKAGES += \
     android.hardware.radio.config@1.0 \
     android.hardware.radio.deprecated@1.0 \
     android.hardware.secure_element@1.0 \
-    android.hardware.wifi@1.0 \
     libaudio-resampler \
     libaudiohal \
     libdrm \
@@ -101,6 +101,7 @@ PRODUCT_HOST_PACKAGES += \
 PRODUCT_PACKAGES += \
     libaudiopolicyengineconfigurable \
     libpolicy-subsystem
+
 
 # Include all zygote init scripts. "ro.zygote" will select one of them.
 PRODUCT_COPY_FILES += \

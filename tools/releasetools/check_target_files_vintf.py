@@ -22,13 +22,16 @@ Usage: check_target_files_vintf target_files
 target_files can be a ZIP file or an extracted target files directory.
 """
 
+import json
 import logging
+import os
+import shutil
 import subprocess
 import sys
-import os
 import zipfile
 
 import common
+from apex_manifest import ParseApexManifest
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +126,13 @@ def CheckVintfFromExtractedTargetFiles(input_tmp, info_dict=None):
     logger.warning('PRODUCT_ENFORCE_VINTF_MANIFEST is not set, skipping checks')
     return True
 
+
   dirmap = GetDirmap(input_tmp)
+
+  # Simulate apexd with target-files.
+  # add a mapping('/apex' => ${input_tmp}/APEX) to dirmap
+  PrepareApexDirectory(input_tmp, dirmap)
+
   args_for_skus = GetArgsForSkus(info_dict)
   shipping_api_level_args = GetArgsForShippingApiLevel(info_dict)
   kernel_args = GetArgsForKernel(input_tmp)
@@ -132,6 +141,7 @@ def CheckVintfFromExtractedTargetFiles(input_tmp, info_dict=None):
       'checkvintf',
       '--check-compat',
   ]
+
   for device_path, real_path in sorted(dirmap.items()):
     common_command += ['--dirmap', '{}:{}'.format(device_path, real_path)]
   common_command += kernel_args
@@ -142,9 +152,10 @@ def CheckVintfFromExtractedTargetFiles(input_tmp, info_dict=None):
     command = common_command + sku_args
     proc = common.Run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     out, err = proc.communicate()
+    last_out_line = out.split()[-1] if out != "" else out
     if proc.returncode == 0:
       logger.info("Command `%s` returns 'compatible'", ' '.join(command))
-    elif out.strip() == "INCOMPATIBLE":
+    elif last_out_line.strip() == "INCOMPATIBLE":
       logger.info("Command `%s` returns 'incompatible'", ' '.join(command))
       success = False
     else:
@@ -185,6 +196,43 @@ def GetVintfFileList():
   paths = sum((PathToPatterns(path) for path in paths if path), [])
   return paths
 
+def GetVintfApexUnzipPatterns():
+  """ Build unzip pattern for APEXes. """
+  patterns = []
+  for target_files_rel_paths in DIR_SEARCH_PATHS.values():
+    for target_files_rel_path in target_files_rel_paths:
+      patterns.append(os.path.join(target_files_rel_path,"apex/*"))
+
+  return patterns
+
+
+def PrepareApexDirectory(inp, dirmap):
+  """ Prepare /apex directory before running checkvintf
+
+  Apex binaries do not support dirmaps, in order to use these binaries we
+  need to move the APEXes from the extracted target file archives to the
+  expected device locations.
+
+  This simulates how apexd activates APEXes.
+  1. create {inp}/APEX which is treated as a "/apex" on device.
+  2. invoke apexd_host with vendor APEXes.
+  """
+
+  apex_dir = common.MakeTempDir('APEX')
+  # checkvintf needs /apex dirmap
+  dirmap['/apex'] = apex_dir
+
+  # Always create /apex directory for dirmap
+  os.makedirs(apex_dir, exist_ok=True)
+
+  # Invoke apexd_host to activate vendor APEXes for checkvintf
+  apex_host = os.path.join(OPTIONS.search_path, 'bin', 'apexd_host')
+  cmd = [apex_host, '--tool_path', OPTIONS.search_path]
+  cmd += ['--apex_path', dirmap['/apex']]
+  if '/vendor' in dirmap:
+      cmd += ['--vendor_path', dirmap['/vendor']]
+  common.RunAndCheckOutput(cmd)
+
 
 def CheckVintfFromTargetFiles(inp, info_dict=None):
   """
@@ -198,7 +246,7 @@ def CheckVintfFromTargetFiles(inp, info_dict=None):
     True if VINTF check is skipped or compatible, False if incompatible. Raise
     a RuntimeError if any error occurs.
   """
-  input_tmp = common.UnzipTemp(inp, GetVintfFileList() + UNZIP_PATTERN)
+  input_tmp = common.UnzipTemp(inp, GetVintfFileList() + GetVintfApexUnzipPatterns() + UNZIP_PATTERN)
   return CheckVintfFromExtractedTargetFiles(input_tmp, info_dict)
 
 

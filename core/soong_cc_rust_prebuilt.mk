@@ -50,6 +50,28 @@ endif
 # to avoid checkbuilds making an extra copy of every module.
 LOCAL_CHECKED_MODULE := $(LOCAL_PREBUILT_MODULE_FILE)
 
+my_check_same_vndk_variants :=
+same_vndk_variants_stamp :=
+ifeq ($(LOCAL_CHECK_SAME_VNDK_VARIANTS),true)
+  ifeq ($(filter hwaddress address, $(SANITIZE_TARGET)),)
+    ifneq ($(CLANG_COVERAGE),true)
+      # Do not compare VNDK variant for special cases e.g. coverage builds.
+      ifneq ($(SKIP_VNDK_VARIANTS_CHECK),true)
+        my_check_same_vndk_variants := true
+        same_vndk_variants_stamp := $(call local-intermediates-dir,,$(LOCAL_2ND_ARCH_VAR_PREFIX))/same_vndk_variants.timestamp
+      endif
+    endif
+  endif
+endif
+
+ifeq ($(my_check_same_vndk_variants),true)
+  # Add the timestamp to the CHECKED list so that `checkbuild` can run it.
+  # Note that because `checkbuild` doesn't check LOCAL_BUILT_MODULE for soong-built modules adding
+  # the timestamp to LOCAL_BUILT_MODULE isn't enough. It is skipped when the vendor variant
+  # isn't used at all and it may break in the downstream trees.
+  LOCAL_ADDITIONAL_CHECKED_MODULE := $(same_vndk_variants_stamp)
+endif
+
 #######################################
 include $(BUILD_SYSTEM)/base_rules.mk
 #######################################
@@ -107,8 +129,13 @@ ifdef LOCAL_INSTALLED_MODULE
   ifdef LOCAL_SHARED_LIBRARIES
     my_shared_libraries := $(LOCAL_SHARED_LIBRARIES)
     ifdef LOCAL_USE_VNDK
-      my_shared_libraries := $(foreach l,$(my_shared_libraries),\
-        $(if $(SPLIT_VENDOR.SHARED_LIBRARIES.$(l)),$(l).vendor,$(l)))
+      ifdef LOCAL_USE_VNDK_PRODUCT
+        my_shared_libraries := $(foreach l,$(my_shared_libraries),\
+          $(if $(SPLIT_PRODUCT.SHARED_LIBRARIES.$(l)),$(l).product,$(l)))
+      else
+        my_shared_libraries := $(foreach l,$(my_shared_libraries),\
+          $(if $(SPLIT_VENDOR.SHARED_LIBRARIES.$(l)),$(l).vendor,$(l)))
+      endif
     endif
     $(LOCAL_2ND_ARCH_VAR_PREFIX)$(my_prefix)DEPENDENCIES_ON_SHARED_LIBRARIES += \
       $(my_register_name):$(LOCAL_INSTALLED_MODULE):$(subst $(space),$(comma),$(my_shared_libraries))
@@ -117,29 +144,20 @@ ifdef LOCAL_INSTALLED_MODULE
     my_dylibs := $(LOCAL_DYLIB_LIBRARIES)
     # Treat these as shared library dependencies for installation purposes.
     ifdef LOCAL_USE_VNDK
-      my_dylibs := $(foreach l,$(my_dylibs),\
-        $(if $(SPLIT_VENDOR.SHARED_LIBRARIES.$(l)),$(l).vendor,$(l)))
+      ifdef LOCAL_USE_VNDK_PRODUCT
+        my_dylibs := $(foreach l,$(my_dylibs),\
+          $(if $(SPLIT_PRODUCT.SHARED_LIBRARIES.$(l)),$(l).product,$(l)))
+      else
+        my_dylibs := $(foreach l,$(my_dylibs),\
+          $(if $(SPLIT_VENDOR.SHARED_LIBRARIES.$(l)),$(l).vendor,$(l)))
+      endif
     endif
     $(LOCAL_2ND_ARCH_VAR_PREFIX)$(my_prefix)DEPENDENCIES_ON_SHARED_LIBRARIES += \
       $(my_register_name):$(LOCAL_INSTALLED_MODULE):$(subst $(space),$(comma),$(my_dylibs))
   endif
 endif
 
-my_check_same_vndk_variants :=
-ifeq ($(LOCAL_CHECK_SAME_VNDK_VARIANTS),true)
-  ifeq ($(filter hwaddress address, $(SANITIZE_TARGET)),)
-    ifneq ($(CLANG_COVERAGE),true)
-        # Do not compare VNDK variant for special cases e.g. coverage builds.
-        ifneq ($(SKIP_VNDK_VARIANTS_CHECK),true)
-            my_check_same_vndk_variants := true
-        endif
-    endif
-  endif
-endif
-
 ifeq ($(my_check_same_vndk_variants),true)
-  same_vndk_variants_stamp := $(intermediates)/same_vndk_variants.timestamp
-
   my_core_register_name := $(subst .vendor,,$(subst .product,,$(my_register_name)))
   my_core_variant_files := $(call module-target-built-files,$(my_core_register_name))
   my_core_shared_lib := $(sort $(filter %.so,$(my_core_variant_files)))
@@ -242,30 +260,6 @@ $(LOCAL_INSTALLED_MODULE): PRIVATE_POST_INSTALL_CMD := \
 endif
 
 $(LOCAL_BUILT_MODULE): $(LOCAL_ADDITIONAL_DEPENDENCIES)
-
-# We don't care about installed rlib/static libraries, since the libraries have
-# already been linked into the module at that point. We do, however, care
-# about the NOTICE files for any rlib/static libraries that we use.
-# (see notice_files.mk)
-#
-# Filter out some NDK libraries that are not being exported.
-my_static_libraries := \
-    $(filter-out ndk_libc++_static ndk_libc++abi ndk_libandroid_support ndk_libunwind \
-      ndk_libc++_static.native_bridge ndk_libc++abi.native_bridge \
-      ndk_libandroid_support.native_bridge ndk_libunwind.native_bridge, \
-      $(LOCAL_STATIC_LIBRARIES))
-installed_static_library_notice_file_targets := \
-    $(foreach lib,$(my_static_libraries) $(LOCAL_WHOLE_STATIC_LIBRARIES), \
-      NOTICE-$(if $(LOCAL_IS_HOST_MODULE),HOST$(if $(my_host_cross),_CROSS,),TARGET)-STATIC_LIBRARIES-$(lib))
-installed_static_library_notice_file_targets += \
-    $(foreach lib,$(LOCAL_RLIB_LIBRARIES), \
-      NOTICE-$(if $(LOCAL_IS_HOST_MODULE),HOST$(if $(my_host_cross),_CROSS,),TARGET)-RLIB_LIBRARIES-$(lib))
-installed_static_library_notice_file_targets += \
-    $(foreach lib,$(LOCAL_PROC_MACRO_LIBRARIES), \
-      NOTICE-$(if $(LOCAL_IS_HOST_MODULE),HOST$(if $(my_host_cross),_CROSS,),TARGET)-PROC_MACRO_LIBRARIES-$(lib))
-
-$(notice_target): | $(installed_static_library_notice_file_targets)
-$(LOCAL_INSTALLED_MODULE): | $(notice_target)
 
 # Reinstall shared library dependencies of fuzz targets to /data/fuzz/ (for
 # target) or /data/ (for host).

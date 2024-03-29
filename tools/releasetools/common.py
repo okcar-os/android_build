@@ -33,20 +33,28 @@ import re
 import shlex
 import shutil
 import subprocess
+import stat
 import sys
 import tempfile
 import threading
 import time
 import zipfile
+
+from typing import Iterable, Callable
+from dataclasses import dataclass
 from hashlib import sha1, sha256
 
 import images
-import rangelib
 import sparse_img
 from blockimgdiff import BlockImageDiff
 
 logger = logging.getLogger(__name__)
 
+
+@dataclass
+class OptionHandler:
+  extra_long_opts: Iterable[str]
+  handler: Callable
 
 class Options(object):
 
@@ -75,15 +83,11 @@ class Options(object):
     self.extra_signapk_args = []
     self.aapt2_path = "aapt2"
     self.java_path = "java"  # Use the one on the path by default.
-    self.java_args = ["-Xmx2048m"]  # The default JVM args.
+    self.java_args = ["-Xmx4096m"]  # The default JVM args.
     self.android_jar_path = None
     self.public_key_suffix = ".x509.pem"
     self.private_key_suffix = ".pk8"
     # use otatools built boot_signer by default
-    self.boot_signer_path = "boot_signer"
-    self.boot_signer_args = []
-    self.verity_signer_path = None
-    self.verity_signer_args = []
     self.verbose = False
     self.tempfiles = []
     self.device_specific = None
@@ -96,7 +100,6 @@ class Options(object):
     self.cache_size = None
     self.stash_threshold = 0.8
     self.logfile = None
-    self.host_tools = {}
 
 
 OPTIONS = Options()
@@ -112,12 +115,17 @@ SPECIAL_CERT_STRINGS = ("PRESIGNED", "EXTERNAL")
 # descriptor into vbmeta.img. When adding a new entry here, the
 # AVB_FOOTER_ARGS_BY_PARTITION in sign_target_files_apks need to be updated
 # accordingly.
-AVB_PARTITIONS = ('boot', 'init_boot', 'dtbo', 'odm', 'product', 'pvmfw', 'recovery',
-                  'system', 'system_ext', 'vendor', 'vendor_boot', 'vendor_kernel_boot',
-                  'vendor_dlkm', 'odm_dlkm', 'system_dlkm')
+AVB_PARTITIONS = ('boot', 'init_boot', 'dtbo', 'odm', 'product', 'pvmfw',
+                  'recovery', 'system', 'system_ext', 'vendor', 'vendor_boot',
+                  'vendor_kernel_boot', 'vendor_dlkm', 'odm_dlkm',
+                  'system_dlkm')
 
 # Chained VBMeta partitions.
 AVB_VBMETA_PARTITIONS = ('vbmeta_system', 'vbmeta_vendor')
+
+# avbtool arguments name
+AVB_ARG_NAME_INCLUDE_DESC_FROM_IMG = '--include_descriptors_from_image'
+AVB_ARG_NAME_CHAIN_PARTITION = '--chain_partition'
 
 # Partitions that should have their care_map added to META/care_map.pb
 PARTITIONS_WITH_CARE_MAP = [
@@ -137,6 +145,19 @@ PARTITIONS_WITH_BUILD_PROP = PARTITIONS_WITH_CARE_MAP + ['boot', 'init_boot']
 # See sysprop.mk. If file is moved, add new search paths here; don't remove
 # existing search paths.
 RAMDISK_BUILD_PROP_REL_PATHS = ['system/etc/ramdisk/build.prop']
+
+
+@dataclass
+class AvbChainedPartitionArg:
+  """The required arguments for avbtool --chain_partition."""
+  partition: str
+  rollback_index_location: int
+  pubkey_path: str
+
+  def to_string(self):
+    """Convert to string command arguments."""
+    return '{}:{}:{}'.format(
+        self.partition, self.rollback_index_location, self.pubkey_path)
 
 
 class ErrorCode(object):
@@ -194,7 +215,7 @@ def InitLogging():
           '': {
               'handlers': ['default'],
               'propagate': True,
-              'level': 'INFO',
+              'level': 'NOTSET',
           }
       }
   }
@@ -224,23 +245,15 @@ def InitLogging():
   logging.config.dictConfig(config)
 
 
-def SetHostToolLocation(tool_name, location):
-  OPTIONS.host_tools[tool_name] = location
-
-
 def FindHostToolPath(tool_name):
   """Finds the path to the host tool.
 
   Args:
     tool_name: name of the tool to find
   Returns:
-    path to the tool if found under either one of the host_tools map or under
-    the same directory as this binary is located at. If not found, tool_name
-    is returned.
+    path to the tool if found under the same directory as this binary is located at. If not found,
+    tool_name is returned.
   """
-  if tool_name in OPTIONS.host_tools:
-    return OPTIONS.host_tools[tool_name]
-
   my_dir = os.path.dirname(os.path.realpath(sys.argv[0]))
   tool_path = os.path.join(my_dir, tool_name)
   if os.path.exists(tool_path):
@@ -302,6 +315,8 @@ def RunAndCheckOutput(args, verbose=None, **kwargs):
   Raises:
     ExternalError: On non-zero exit from the command.
   """
+  if verbose is None:
+    verbose = OPTIONS.verbose
   proc = Run(args, verbose=verbose, **kwargs)
   output, _ = proc.communicate()
   if output is None:
@@ -448,10 +463,40 @@ class BuildInfo(object):
 
   @property
   def is_vabc(self):
+    return self.info_dict.get("virtual_ab_compression") == "true"
+
+  @property
+  def is_android_r(self):
+    system_prop = self.info_dict.get("system.build.prop")
+    return system_prop and system_prop.GetProp("ro.build.version.release") == "11"
+
+  @property
+  def is_release_key(self):
+    system_prop = self.info_dict.get("build.prop")
+    return system_prop and system_prop.GetProp("ro.build.tags") == "release-key"
+
+  @property
+  def vabc_compression_param(self):
+    return self.get("virtual_ab_compression_method", "")
+
+  @property
+  def vendor_api_level(self):
     vendor_prop = self.info_dict.get("vendor.build.prop")
-    vabc_enabled = vendor_prop and \
-        vendor_prop.GetProp("ro.virtual_ab.compression.enabled") == "true"
-    return vabc_enabled
+    if not vendor_prop:
+      return -1
+
+    props = [
+        "ro.board.api_level",
+        "ro.board.first_api_level",
+        "ro.product.first_api_level",
+    ]
+    for prop in props:
+      value = vendor_prop.GetProp(prop)
+      try:
+        return int(value)
+      except:
+        pass
+    return -1
 
   @property
   def is_vabc_xor(self):
@@ -691,18 +736,71 @@ class BuildInfo(object):
       script.AssertOemProperty(prop, values, oem_no_mount)
 
 
-def ReadFromInputFile(input_file, fn):
-  """Reads the contents of fn from input zipfile or directory."""
+def DoesInputFileContain(input_file, fn):
+  """Check whether the input target_files.zip contain an entry `fn`"""
   if isinstance(input_file, zipfile.ZipFile):
-    return input_file.read(fn).decode()
+    return fn in input_file.namelist()
+  elif zipfile.is_zipfile(input_file):
+    with zipfile.ZipFile(input_file, "r", allowZip64=True) as zfp:
+      return fn in zfp.namelist()
   else:
+    if not os.path.isdir(input_file):
+      raise ValueError(
+          "Invalid input_file, accepted inputs are ZipFile object, path to .zip file on disk, or path to extracted directory. Actual: " + input_file)
+    path = os.path.join(input_file, *fn.split("/"))
+    return os.path.exists(path)
+
+
+def ReadBytesFromInputFile(input_file, fn):
+  """Reads the bytes of fn from input zipfile or directory."""
+  if isinstance(input_file, zipfile.ZipFile):
+    return input_file.read(fn)
+  elif zipfile.is_zipfile(input_file):
+    with zipfile.ZipFile(input_file, "r", allowZip64=True) as zfp:
+      return zfp.read(fn)
+  else:
+    if not os.path.isdir(input_file):
+      raise ValueError(
+          "Invalid input_file, accepted inputs are ZipFile object, path to .zip file on disk, or path to extracted directory. Actual: " + input_file)
     path = os.path.join(input_file, *fn.split("/"))
     try:
-      with open(path) as f:
+      with open(path, "rb") as f:
         return f.read()
     except IOError as e:
       if e.errno == errno.ENOENT:
         raise KeyError(fn)
+
+
+def ReadFromInputFile(input_file, fn):
+  """Reads the str contents of fn from input zipfile or directory."""
+  return ReadBytesFromInputFile(input_file, fn).decode()
+
+
+def WriteBytesToInputFile(input_file, fn, data):
+  """Write bytes |data| contents to fn of input zipfile or directory."""
+  if isinstance(input_file, zipfile.ZipFile):
+    with input_file.open(fn, "w") as entry_fp:
+      return entry_fp.write(data)
+  elif zipfile.is_zipfile(input_file):
+    with zipfile.ZipFile(input_file, "r", allowZip64=True) as zfp:
+      with zfp.open(fn, "w") as entry_fp:
+        return entry_fp.write(data)
+  else:
+    if not os.path.isdir(input_file):
+      raise ValueError(
+          "Invalid input_file, accepted inputs are ZipFile object, path to .zip file on disk, or path to extracted directory. Actual: " + input_file)
+    path = os.path.join(input_file, *fn.split("/"))
+    try:
+      with open(path, "wb") as f:
+        return f.write(data)
+    except IOError as e:
+      if e.errno == errno.ENOENT:
+        raise KeyError(fn)
+
+
+def WriteToInputFile(input_file, fn, str: str):
+  """Write str content to fn of input file or directory"""
+  return WriteBytesToInputFile(input_file, fn, str.encode())
 
 
 def ExtractFromInputFile(input_file, fn):
@@ -712,7 +810,16 @@ def ExtractFromInputFile(input_file, fn):
     with open(tmp_file, 'wb') as f:
       f.write(input_file.read(fn))
     return tmp_file
+  elif zipfile.is_zipfile(input_file):
+    with zipfile.ZipFile(input_file, "r", allowZip64=True) as zfp:
+      tmp_file = MakeTempFile(os.path.basename(fn))
+      with open(tmp_file, "wb") as fp:
+        fp.write(zfp.read(fn))
+      return tmp_file
   else:
+    if not os.path.isdir(input_file):
+      raise ValueError(
+          "Invalid input_file, accepted inputs are ZipFile object, path to .zip file on disk, or path to extracted directory. Actual: " + input_file)
     file = os.path.join(input_file, *fn.split("/"))
     if not os.path.exists(file):
       raise KeyError(fn)
@@ -725,7 +832,7 @@ class RamdiskFormat(object):
   XZ = 3
 
 
-def _GetRamdiskFormat(info_dict):
+def GetRamdiskFormat(info_dict):
   if info_dict.get('lz4_ramdisks') == 'true':
     ramdisk_format = RamdiskFormat.LZ4
   elif info_dict.get('xz_ramdisks') == 'true':
@@ -835,8 +942,12 @@ def LoadInfoDict(input_file, repacking=False):
     makeint(b.replace(".img", "_size"))
 
   # Load recovery fstab if applicable.
-  d["fstab"] = _FindAndLoadRecoveryFstab(d, input_file, read_helper)
-  ramdisk_format = _GetRamdiskFormat(d)
+  if isinstance(input_file, str) and zipfile.is_zipfile(input_file):
+    with zipfile.ZipFile(input_file, 'r', allowZip64=True) as input_zip:
+      d["fstab"] = _FindAndLoadRecoveryFstab(d, input_zip, read_helper)
+  else:
+    d["fstab"] = _FindAndLoadRecoveryFstab(d, input_file, read_helper)
+  ramdisk_format = GetRamdiskFormat(d)
 
   # Tries to load the build props for all partitions with care_map, including
   # system and vendor.
@@ -846,16 +957,7 @@ def LoadInfoDict(input_file, repacking=False):
         input_file, partition, ramdisk_format=ramdisk_format)
   d["build.prop"] = d["system.build.prop"]
 
-  # Set up the salt (based on fingerprint) that will be used when adding AVB
-  # hash / hashtree footers.
   if d.get("avb_enable") == "true":
-    build_info = BuildInfo(d, use_legacy_id=True)
-    for partition in PARTITIONS_WITH_BUILD_PROP:
-      fingerprint = build_info.GetPartitionFingerprint(partition)
-      if fingerprint:
-        d["avb_{}_salt".format(partition)] = sha256(
-            fingerprint.encode()).hexdigest()
-
     # Set the vbmeta digest if exists
     try:
       d["vbmeta_digest"] = read_helper("META/vbmeta_digest.txt").rstrip()
@@ -911,7 +1013,7 @@ class PartitionBuildProps(object):
         each of the variables.
     ramdisk_format: If name is "boot", the format of ramdisk inside the
         boot image. Otherwise, its value is ignored.
-        Use lz4 to decompress by default. If its value is gzip, use minigzip.
+        Use lz4 to decompress by default. If its value is gzip, use gzip.
   """
 
   def __init__(self, input_file, name, placeholder_values=None):
@@ -1050,12 +1152,18 @@ class PartitionBuildProps(object):
     return {key: val for key, val in d.items()
             if key in self.props_allow_override}
 
+  def __getstate__(self):
+    state = self.__dict__.copy()
+    # Don't pickle baz
+    if "input_file" in state and isinstance(state["input_file"], zipfile.ZipFile):
+      state["input_file"] = state["input_file"].filename
+    return state
+
   def GetProp(self, prop):
     return self.build_props.get(prop)
 
 
-def LoadRecoveryFSTab(read_helper, fstab_version, recovery_fstab_path,
-                      system_root_image=False):
+def LoadRecoveryFSTab(read_helper, fstab_version, recovery_fstab_path):
   class Partition(object):
     def __init__(self, mount_point, fs_type, device, length, context, slotselect):
       self.mount_point = mount_point
@@ -1115,12 +1223,6 @@ def LoadRecoveryFSTab(read_helper, fstab_version, recovery_fstab_path,
                                    device=pieces[0], length=length, context=context,
                                    slotselect=slotselect)
 
-  # / is used for the system mount point when the root directory is included in
-  # system. Other areas assume system is always at "/system" so point /system
-  # at /.
-  if system_root_image:
-    assert '/system' not in d and '/' in d
-    d["/system"] = d["/"]
   return d
 
 
@@ -1136,32 +1238,19 @@ def _FindAndLoadRecoveryFstab(info_dict, input_file, read_helper):
   # ../RAMDISK/system/etc/recovery.fstab. This function has to handle both
   # cases, since it may load the info_dict from an old build (e.g. when
   # generating incremental OTAs from that build).
-  system_root_image = info_dict.get('system_root_image') == 'true'
   if info_dict.get('no_recovery') != 'true':
     recovery_fstab_path = 'RECOVERY/RAMDISK/system/etc/recovery.fstab'
-    if isinstance(input_file, zipfile.ZipFile):
-      if recovery_fstab_path not in input_file.namelist():
-        recovery_fstab_path = 'RECOVERY/RAMDISK/etc/recovery.fstab'
-    else:
-      path = os.path.join(input_file, *recovery_fstab_path.split('/'))
-      if not os.path.exists(path):
-        recovery_fstab_path = 'RECOVERY/RAMDISK/etc/recovery.fstab'
+    if not DoesInputFileContain(input_file, recovery_fstab_path):
+      recovery_fstab_path = 'RECOVERY/RAMDISK/etc/recovery.fstab'
     return LoadRecoveryFSTab(
-        read_helper, info_dict['fstab_version'], recovery_fstab_path,
-        system_root_image)
+        read_helper, info_dict['fstab_version'], recovery_fstab_path)
 
   if info_dict.get('recovery_as_boot') == 'true':
     recovery_fstab_path = 'BOOT/RAMDISK/system/etc/recovery.fstab'
-    if isinstance(input_file, zipfile.ZipFile):
-      if recovery_fstab_path not in input_file.namelist():
-        recovery_fstab_path = 'BOOT/RAMDISK/etc/recovery.fstab'
-    else:
-      path = os.path.join(input_file, *recovery_fstab_path.split('/'))
-      if not os.path.exists(path):
-        recovery_fstab_path = 'BOOT/RAMDISK/etc/recovery.fstab'
+    if not DoesInputFileContain(input_file, recovery_fstab_path):
+      recovery_fstab_path = 'BOOT/RAMDISK/etc/recovery.fstab'
     return LoadRecoveryFSTab(
-        read_helper, info_dict['fstab_version'], recovery_fstab_path,
-        system_root_image)
+        read_helper, info_dict['fstab_version'], recovery_fstab_path)
 
   return None
 
@@ -1185,13 +1274,13 @@ def MergeDynamicPartitionInfoDicts(framework_dict, vendor_dict):
   """
 
   def uniq_concat(a, b):
-    combined = set(a.split(" "))
-    combined.update(set(b.split(" ")))
+    combined = set(a.split())
+    combined.update(set(b.split()))
     combined = [item.strip() for item in combined if item.strip()]
     return " ".join(sorted(combined))
 
   if (framework_dict.get("use_dynamic_partitions") !=
-        "true") or (vendor_dict.get("use_dynamic_partitions") != "true"):
+          "true") or (vendor_dict.get("use_dynamic_partitions") != "true"):
     raise ValueError("Both dictionaries must have use_dynamic_partitions=true")
 
   merged_dict = {"use_dynamic_partitions": "true"}
@@ -1207,7 +1296,7 @@ def MergeDynamicPartitionInfoDicts(framework_dict, vendor_dict):
   # Super block devices are defined by the vendor dict.
   if "super_block_devices" in vendor_dict:
     merged_dict["super_block_devices"] = vendor_dict["super_block_devices"]
-    for block_device in merged_dict["super_block_devices"].split(" "):
+    for block_device in merged_dict["super_block_devices"].split():
       key = "super_%s_device_size" % block_device
       if key not in vendor_dict:
         raise ValueError("Vendor dict does not contain required key %s." % key)
@@ -1216,7 +1305,7 @@ def MergeDynamicPartitionInfoDicts(framework_dict, vendor_dict):
   # Partition groups and group sizes are defined by the vendor dict because
   # these values may vary for each board that uses a shared system image.
   merged_dict["super_partition_groups"] = vendor_dict["super_partition_groups"]
-  for partition_group in merged_dict["super_partition_groups"].split(" "):
+  for partition_group in merged_dict["super_partition_groups"].split():
     # Set the partition group's size using the value from the vendor dict.
     key = "super_%s_group_size" % partition_group
     if key not in vendor_dict:
@@ -1325,25 +1414,50 @@ def RunHostInitVerifier(product_out, partition_map):
   return RunAndCheckOutput(cmd)
 
 
-def AppendAVBSigningArgs(cmd, partition):
+def AppendAVBSigningArgs(cmd, partition, avb_salt=None):
   """Append signing arguments for avbtool."""
   # e.g., "--key path/to/signing_key --algorithm SHA256_RSA4096"
-  key_path = OPTIONS.info_dict.get("avb_" + partition + "_key_path")
-  if key_path and not os.path.exists(key_path) and OPTIONS.search_path:
-    new_key_path = os.path.join(OPTIONS.search_path, key_path)
-    if os.path.exists(new_key_path):
-      key_path = new_key_path
+  key_path = ResolveAVBSigningPathArgs(
+      OPTIONS.info_dict.get("avb_" + partition + "_key_path"))
   algorithm = OPTIONS.info_dict.get("avb_" + partition + "_algorithm")
   if key_path and algorithm:
     cmd.extend(["--key", key_path, "--algorithm", algorithm])
-  avb_salt = OPTIONS.info_dict.get("avb_salt")
+  if avb_salt is None:
+    avb_salt = OPTIONS.info_dict.get("avb_salt")
   # make_vbmeta_image doesn't like "--salt" (and it's not needed).
   if avb_salt and not partition.startswith("vbmeta"):
     cmd.extend(["--salt", avb_salt])
 
 
+def ResolveAVBSigningPathArgs(split_args):
+
+  def ResolveBinaryPath(path):
+    if os.path.exists(path):
+      return path
+    if OPTIONS.search_path:
+      new_path = os.path.join(OPTIONS.search_path, path)
+      if os.path.exists(new_path):
+        return new_path
+    raise ExternalError(
+        "Failed to find {}".format(path))
+
+  if not split_args:
+    return split_args
+
+  if isinstance(split_args, list):
+    for index, arg in enumerate(split_args[:-1]):
+      if arg == '--signing_helper':
+        signing_helper_path = split_args[index + 1]
+        split_args[index + 1] = ResolveBinaryPath(signing_helper_path)
+        break
+  elif isinstance(split_args, str):
+    split_args = ResolveBinaryPath(split_args)
+
+  return split_args
+
+
 def GetAvbPartitionArg(partition, image, info_dict=None):
-  """Returns the VBMeta arguments for partition.
+  """Returns the VBMeta arguments for one partition.
 
   It sets up the VBMeta argument by including the partition descriptor from the
   given 'image', or by configuring the partition as a chained partition.
@@ -1355,7 +1469,7 @@ def GetAvbPartitionArg(partition, image, info_dict=None):
         OPTIONS.info_dict if None has been given.
 
   Returns:
-    A list of VBMeta arguments.
+    A list of VBMeta arguments for one partition.
   """
   if info_dict is None:
     info_dict = OPTIONS.info_dict
@@ -1363,7 +1477,7 @@ def GetAvbPartitionArg(partition, image, info_dict=None):
   # Check if chain partition is used.
   key_path = info_dict.get("avb_" + partition + "_key_path")
   if not key_path:
-    return ["--include_descriptors_from_image", image]
+    return [AVB_ARG_NAME_INCLUDE_DESC_FROM_IMG, image]
 
   # For a non-A/B device, we don't chain /recovery nor include its descriptor
   # into vbmeta.img. The recovery image will be configured on an independent
@@ -1375,7 +1489,62 @@ def GetAvbPartitionArg(partition, image, info_dict=None):
 
   # Otherwise chain the partition into vbmeta.
   chained_partition_arg = GetAvbChainedPartitionArg(partition, info_dict)
-  return ["--chain_partition", chained_partition_arg]
+  return [AVB_ARG_NAME_CHAIN_PARTITION, chained_partition_arg]
+
+
+def GetAvbPartitionsArg(partitions,
+                        resolve_rollback_index_location_conflict=False,
+                        info_dict=None):
+  """Returns the VBMeta arguments for all AVB partitions.
+
+  It sets up the VBMeta argument by calling GetAvbPartitionArg of all
+  partitions.
+
+  Args:
+    partitions: A dict of all AVB partitions.
+    resolve_rollback_index_location_conflict: If true, resolve conflicting avb
+        rollback index locations by assigning the smallest unused value.
+    info_dict: A dict returned by common.LoadInfoDict().
+
+  Returns:
+    A list of VBMeta arguments for all partitions.
+  """
+  # An AVB partition will be linked into a vbmeta partition by either
+  # AVB_ARG_NAME_INCLUDE_DESC_FROM_IMG or AVB_ARG_NAME_CHAIN_PARTITION, there
+  # should be no other cases.
+  valid_args = {
+      AVB_ARG_NAME_INCLUDE_DESC_FROM_IMG: [],
+      AVB_ARG_NAME_CHAIN_PARTITION: []
+  }
+
+  for partition, path in partitions.items():
+    avb_partition_arg = GetAvbPartitionArg(partition, path, info_dict)
+    if not avb_partition_arg:
+      continue
+    arg_name, arg_value = avb_partition_arg
+    assert arg_name in valid_args
+    valid_args[arg_name].append(arg_value)
+
+  # Copy the arguments for non-chained AVB partitions directly without
+  # intervention.
+  avb_args = []
+  for image in valid_args[AVB_ARG_NAME_INCLUDE_DESC_FROM_IMG]:
+    avb_args.extend([AVB_ARG_NAME_INCLUDE_DESC_FROM_IMG, image])
+
+  # Handle chained AVB partitions. The rollback index location might be
+  # adjusted if two partitions use the same value. This may happen when mixing
+  # a shared system image with other vendor images.
+  used_index_loc = set()
+  for chained_partition_arg in valid_args[AVB_ARG_NAME_CHAIN_PARTITION]:
+    if resolve_rollback_index_location_conflict:
+      while chained_partition_arg.rollback_index_location in used_index_loc:
+        chained_partition_arg.rollback_index_location += 1
+
+    used_index_loc.add(chained_partition_arg.rollback_index_location)
+    avb_args.extend([AVB_ARG_NAME_CHAIN_PARTITION,
+                     chained_partition_arg.to_string()])
+
+  return avb_args
 
 
 def GetAvbChainedPartitionArg(partition, info_dict, key=None):
@@ -1389,19 +1558,19 @@ def GetAvbChainedPartitionArg(partition, info_dict, key=None):
         the key listed in info_dict.
 
   Returns:
-    A string of form "partition:rollback_index_location:key" that can be used to
-    build or verify vbmeta image.
+    An AvbChainedPartitionArg object with rollback_index_location and
+    pubkey_path that can be used to build or verify vbmeta image.
   """
   if key is None:
     key = info_dict["avb_" + partition + "_key_path"]
-  if key and not os.path.exists(key) and OPTIONS.search_path:
-    new_key_path = os.path.join(OPTIONS.search_path, key)
-    if os.path.exists(new_key_path):
-      key = new_key_path
+  key = ResolveAVBSigningPathArgs(key)
   pubkey_path = ExtractAvbPublicKey(info_dict["avb_avbtool"], key)
   rollback_index_location = info_dict[
       "avb_" + partition + "_rollback_index_location"]
-  return "{}:{}:{}".format(partition, rollback_index_location, pubkey_path)
+  return AvbChainedPartitionArg(
+      partition=partition,
+      rollback_index_location=int(rollback_index_location),
+      pubkey_path=pubkey_path)
 
 
 def _HasGkiCertificationArgs():
@@ -1413,10 +1582,7 @@ def _GenerateGkiCertificate(image, image_name):
   key_path = OPTIONS.info_dict.get("gki_signing_key_path")
   algorithm = OPTIONS.info_dict.get("gki_signing_algorithm")
 
-  if not os.path.exists(key_path) and OPTIONS.search_path:
-    new_key_path = os.path.join(OPTIONS.search_path, key_path)
-    if os.path.exists(new_key_path):
-      key_path = new_key_path
+  key_path = ResolveAVBSigningPathArgs(key_path)
 
   # Checks key_path exists, before processing --gki_signing_* args.
   if not os.path.exists(key_path):
@@ -1451,7 +1617,8 @@ def _GenerateGkiCertificate(image, image_name):
   return data
 
 
-def BuildVBMeta(image_path, partitions, name, needed_partitions):
+def BuildVBMeta(image_path, partitions, name, needed_partitions,
+                resolve_rollback_index_location_conflict=False):
   """Creates a VBMeta image.
 
   It generates the requested VBMeta image. The requested image could be for
@@ -1466,6 +1633,8 @@ def BuildVBMeta(image_path, partitions, name, needed_partitions):
     name: Name of the VBMeta partition, e.g. 'vbmeta', 'vbmeta_system'.
     needed_partitions: Partitions whose descriptors should be included into the
         generated VBMeta image.
+    resolve_rollback_index_location_conflict: If true, resolve conflicting avb
+        rollback index locations by assigning the smallest unused value.
 
   Raises:
     AssertionError: On invalid input args.
@@ -1476,17 +1645,23 @@ def BuildVBMeta(image_path, partitions, name, needed_partitions):
 
   custom_partitions = OPTIONS.info_dict.get(
       "avb_custom_images_partition_list", "").strip().split()
+  custom_avb_partitions = ["vbmeta_" + part for part in OPTIONS.info_dict.get(
+      "avb_custom_vbmeta_images_partition_list", "").strip().split()]
 
+  avb_partitions = {}
   for partition, path in partitions.items():
     if partition not in needed_partitions:
       continue
     assert (partition in AVB_PARTITIONS or
             partition in AVB_VBMETA_PARTITIONS or
+            partition in custom_avb_partitions or
             partition in custom_partitions), \
         'Unknown partition: {}'.format(partition)
     assert os.path.exists(path), \
         'Failed to find {} for {}'.format(path, partition)
-    cmd.extend(GetAvbPartitionArg(partition, path))
+    avb_partitions[partition] = path
+  cmd.extend(GetAvbPartitionsArg(avb_partitions,
+                                 resolve_rollback_index_location_conflict))
 
   args = OPTIONS.info_dict.get("avb_{}_args".format(name))
   if args and args.strip():
@@ -1497,7 +1672,7 @@ def BuildVBMeta(image_path, partitions, name, needed_partitions):
       # same location when running this script (we have the input target_files
       # zip only). For such cases, we additionally scan other locations (e.g.
       # IMAGES/, RADIO/, etc) before bailing out.
-      if arg == '--include_descriptors_from_image':
+      if arg == AVB_ARG_NAME_INCLUDE_DESC_FROM_IMG:
         chained_image = split_args[index + 1]
         if os.path.exists(chained_image):
           continue
@@ -1510,20 +1685,28 @@ def BuildVBMeta(image_path, partitions, name, needed_partitions):
             found = True
             break
         assert found, 'Failed to find {}'.format(chained_image)
+
+    split_args = ResolveAVBSigningPathArgs(split_args)
     cmd.extend(split_args)
 
   RunAndCheckOutput(cmd)
 
 
 def _MakeRamdisk(sourcedir, fs_config_file=None,
+                 dev_node_file=None,
                  ramdisk_format=RamdiskFormat.GZ):
   ramdisk_img = tempfile.NamedTemporaryFile()
 
-  if fs_config_file is not None and os.access(fs_config_file, os.F_OK):
-    cmd = ["mkbootfs", "-f", fs_config_file,
-           os.path.join(sourcedir, "RAMDISK")]
-  else:
-    cmd = ["mkbootfs", os.path.join(sourcedir, "RAMDISK")]
+  cmd = ["mkbootfs"]
+
+  if fs_config_file and os.access(fs_config_file, os.F_OK):
+    cmd.extend(["-f", fs_config_file])
+
+  if dev_node_file and os.access(dev_node_file, os.F_OK):
+    cmd.extend(["-n", dev_node_file])
+
+  cmd.append(os.path.join(sourcedir, "RAMDISK"))
+
   p1 = Run(cmd, stdout=subprocess.PIPE)
   if ramdisk_format == RamdiskFormat.LZ4:
     p2 = Run(["lz4", "-l", "-12", "--favor-decSpeed"], stdin=p1.stdout,
@@ -1532,9 +1715,9 @@ def _MakeRamdisk(sourcedir, fs_config_file=None,
     p2 = Run(["xz", "-f", "-c", "--check=crc32", "--lzma2=dict=32MiB"], stdin=p1.stdout,
              stdout=ramdisk_img.file.fileno())
   elif ramdisk_format == RamdiskFormat.GZ:
-    p2 = Run(["minigzip"], stdin=p1.stdout, stdout=ramdisk_img.file.fileno())
+    p2 = Run(["gzip"], stdin=p1.stdout, stdout=ramdisk_img.file.fileno())
   else:
-    raise ValueError("Only support lz4, xz, or minigzip ramdisk format.")
+    raise ValueError("Only support lz4, xz, or gzip ramdisk format.")
 
   p2.wait()
   p1.wait()
@@ -1544,7 +1727,8 @@ def _MakeRamdisk(sourcedir, fs_config_file=None,
   return ramdisk_img
 
 
-def _BuildBootableImage(image_name, sourcedir, fs_config_file, info_dict=None,
+def _BuildBootableImage(image_name, sourcedir, fs_config_file,
+                        dev_node_file=None, info_dict=None,
                         has_ramdisk=False, two_step_image=False):
   """Build a bootable image from the specified sourcedir.
 
@@ -1585,8 +1769,8 @@ def _BuildBootableImage(image_name, sourcedir, fs_config_file, info_dict=None,
   img = tempfile.NamedTemporaryFile()
 
   if has_ramdisk:
-    ramdisk_format = _GetRamdiskFormat(info_dict)
-    ramdisk_img = _MakeRamdisk(sourcedir, fs_config_file,
+    ramdisk_format = GetRamdiskFormat(info_dict)
+    ramdisk_img = _MakeRamdisk(sourcedir, fs_config_file, dev_node_file,
                                ramdisk_format=ramdisk_format)
 
   # use MKBOOTIMG from environ, or "mkbootimg" if empty or not set
@@ -1686,23 +1870,8 @@ def _BuildBootableImage(image_name, sourcedir, fs_config_file, info_dict=None,
     with open(img.name, 'ab') as f:
       f.write(boot_signature_bytes)
 
-  if (info_dict.get("boot_signer") == "true" and
-          info_dict.get("verity_key")):
-    # Hard-code the path as "/boot" for two-step special recovery image (which
-    # will be loaded into /boot during the two-step OTA).
-    if two_step_image:
-      path = "/boot"
-    else:
-      path = "/" + partition_name
-    cmd = [OPTIONS.boot_signer_path]
-    cmd.extend(OPTIONS.boot_signer_args)
-    cmd.extend([path, img.name,
-                info_dict["verity_key"] + ".pk8",
-                info_dict["verity_key"] + ".x509.pem", img.name])
-    RunAndCheckOutput(cmd)
-
   # Sign the image if vboot is non-empty.
-  elif info_dict.get("vboot"):
+  if info_dict.get("vboot"):
     path = "/" + partition_name
     img_keyblock = tempfile.NamedTemporaryFile()
     # We have switched from the prebuilt futility binary to using the tool
@@ -1733,10 +1902,15 @@ def _BuildBootableImage(image_name, sourcedir, fs_config_file, info_dict=None,
     cmd = [avbtool, "add_hash_footer", "--image", img.name,
            "--partition_size", str(part_size), "--partition_name",
            partition_name]
-    AppendAVBSigningArgs(cmd, partition_name)
+    salt = None
+    if kernel_path is not None:
+      with open(kernel_path, "rb") as fp:
+        salt = sha256(fp.read()).hexdigest()
+    AppendAVBSigningArgs(cmd, partition_name, salt)
     args = info_dict.get("avb_" + partition_name + "_add_hash_footer_args")
     if args and args.strip():
-      cmd.extend(shlex.split(args))
+      split_args = ResolveAVBSigningPathArgs(shlex.split(args))
+      cmd.extend(split_args)
     RunAndCheckOutput(cmd)
 
   img.seek(os.SEEK_SET, 0)
@@ -1774,10 +1948,22 @@ def _SignBootableImage(image_path, prebuilt_name, partition_name,
     cmd = [avbtool, "add_hash_footer", "--image", image_path,
            "--partition_size", str(part_size), "--partition_name",
            partition_name]
-    AppendAVBSigningArgs(cmd, partition_name)
+    # Use sha256 of the kernel as salt for reproducible builds
+    with tempfile.TemporaryDirectory() as tmpdir:
+      RunAndCheckOutput(["unpack_bootimg", "--boot_img", image_path, "--out", tmpdir])
+      for filename in ["kernel", "ramdisk", "vendor_ramdisk00"]:
+        path = os.path.join(tmpdir, filename)
+        if os.path.exists(path) and os.path.getsize(path):
+          print("Using {} as salt for avb footer of {}".format(
+              filename, partition_name))
+          with open(path, "rb") as fp:
+            salt = sha256(fp.read()).hexdigest()
+            break
+    AppendAVBSigningArgs(cmd, partition_name, salt)
     args = info_dict.get("avb_" + partition_name + "_add_hash_footer_args")
     if args and args.strip():
-      cmd.extend(shlex.split(args))
+      split_args = ResolveAVBSigningPathArgs(shlex.split(args))
+      cmd.extend(split_args)
     RunAndCheckOutput(cmd)
 
 
@@ -1800,11 +1986,6 @@ def HasRamdisk(partition_name, info_dict=None):
   if info_dict.get("gki_boot_image_without_ramdisk") == "true":
     return False  # A GKI boot.img has no ramdisk since Android-13.
 
-  if info_dict.get("system_root_image") == "true":
-    # The ramdisk content is merged into the system.img, so there is NO
-    # ramdisk in the boot.img or boot-<kernel version>.img.
-    return False
-
   if info_dict.get("init_boot") == "true":
     # The ramdisk is moved to the init_boot.img, so there is NO
     # ramdisk in the boot.img or boot-<kernel version>.img.
@@ -1814,7 +1995,8 @@ def HasRamdisk(partition_name, info_dict=None):
 
 
 def GetBootableImage(name, prebuilt_name, unpack_dir, tree_subdir,
-                     info_dict=None, two_step_image=False):
+                     info_dict=None, two_step_image=False,
+                     dev_nodes=False):
   """Return a File object with the desired bootable image.
 
   Look for it in 'unpack_dir'/BOOTABLE_IMAGES under the name 'prebuilt_name',
@@ -1850,6 +2032,8 @@ def GetBootableImage(name, prebuilt_name, unpack_dir, tree_subdir,
   fs_config = "META/" + tree_subdir.lower() + "_filesystem_config.txt"
   data = _BuildBootableImage(prebuilt_name, os.path.join(unpack_dir, tree_subdir),
                              os.path.join(unpack_dir, fs_config),
+                             os.path.join(unpack_dir, 'META/ramdisk_node_list')
+                             if dev_nodes else None,
                              info_dict, has_ramdisk, two_step_image)
   if data:
     return File(name, data)
@@ -1871,7 +2055,7 @@ def _BuildVendorBootImage(sourcedir, partition_name, info_dict=None):
 
   img = tempfile.NamedTemporaryFile()
 
-  ramdisk_format = _GetRamdiskFormat(info_dict)
+  ramdisk_format = GetRamdiskFormat(info_dict)
   ramdisk_img = _MakeRamdisk(sourcedir, ramdisk_format=ramdisk_format)
 
   # use MKBOOTIMG from environ, or "mkbootimg" if empty or not set
@@ -1881,7 +2065,8 @@ def _BuildVendorBootImage(sourcedir, partition_name, info_dict=None):
 
   fn = os.path.join(sourcedir, "dtb")
   if os.access(fn, os.F_OK):
-    has_vendor_kernel_boot = (info_dict.get("vendor_kernel_boot", "").lower() == "true")
+    has_vendor_kernel_boot = (info_dict.get(
+        "vendor_kernel_boot", "").lower() == "true")
 
     # Pack dtb into vendor_kernel_boot if building vendor_kernel_boot.
     # Otherwise pack dtb into vendor_boot.
@@ -1953,7 +2138,8 @@ def _BuildVendorBootImage(sourcedir, partition_name, info_dict=None):
     AppendAVBSigningArgs(cmd, partition_name)
     args = info_dict.get(f'avb_{partition_name}_add_hash_footer_args')
     if args and args.strip():
-      cmd.extend(shlex.split(args))
+      split_args = ResolveAVBSigningPathArgs(shlex.split(args))
+      cmd.extend(split_args)
     RunAndCheckOutput(cmd)
 
   img.seek(os.SEEK_SET, 0)
@@ -1992,7 +2178,7 @@ def GetVendorBootImage(name, prebuilt_name, unpack_dir, tree_subdir,
 
 
 def GetVendorKernelBootImage(name, prebuilt_name, unpack_dir, tree_subdir,
-                       info_dict=None):
+                             info_dict=None):
   """Return a File object with the desired vendor kernel boot image.
 
   Look for it under 'unpack_dir'/IMAGES, otherwise construct it from
@@ -2022,6 +2208,39 @@ def Gunzip(in_filename, out_filename):
     shutil.copyfileobj(in_file, out_file)
 
 
+def UnzipSingleFile(input_zip: zipfile.ZipFile, info: zipfile.ZipInfo, dirname: str):
+  # According to https://stackoverflow.com/questions/434641/how-do-i-set-permissions-attributes-on-a-file-in-a-zip-file-using-pythons-zip/6297838#6297838
+  # higher bits of |external_attr| are unix file permission and types
+  unix_filetype = info.external_attr >> 16
+  file_perm = unix_filetype & 0o777
+
+  def CheckMask(a, mask):
+    return (a & mask) == mask
+
+  def IsSymlink(a):
+    return CheckMask(a, stat.S_IFLNK)
+
+  def IsDir(a):
+    return CheckMask(a, stat.S_IFDIR)
+  # python3.11 zipfile implementation doesn't handle symlink correctly
+  if not IsSymlink(unix_filetype):
+    target = input_zip.extract(info, dirname)
+    # We want to ensure that the file is at least read/writable by owner and readable by all users
+    if IsDir(unix_filetype):
+      os.chmod(target, file_perm | 0o755)
+    else:
+      os.chmod(target, file_perm | 0o644)
+    return target
+  if dirname is None:
+    dirname = os.getcwd()
+  target = os.path.join(dirname, info.filename)
+  os.makedirs(os.path.dirname(target), exist_ok=True)
+  if os.path.exists(target):
+    os.unlink(target)
+  os.symlink(input_zip.read(info).decode(), target)
+  return target
+
+
 def UnzipToDir(filename, dirname, patterns=None):
   """Unzips the archive to the given directory.
 
@@ -2032,20 +2251,46 @@ def UnzipToDir(filename, dirname, patterns=None):
         archvie. Non-matching patterns will be filtered out. If there's no match
         after the filtering, no file will be unzipped.
   """
-  cmd = ["unzip", "-o", "-q", filename, "-d", dirname]
-  if patterns is not None:
+  with zipfile.ZipFile(filename, allowZip64=True, mode="r") as input_zip:
     # Filter out non-matching patterns. unzip will complain otherwise.
-    with zipfile.ZipFile(filename, allowZip64=True) as input_zip:
-      names = input_zip.namelist()
-    filtered = [
-        pattern for pattern in patterns if fnmatch.filter(names, pattern)]
+    entries = input_zip.infolist()
+    # b/283033491
+    # Per https://en.wikipedia.org/wiki/ZIP_(file_format)#Central_directory_file_header
+    # In zip64 mode, central directory record's header_offset field might be
+    # set to 0xFFFFFFFF if header offset is > 2^32. In this case, the extra
+    # fields will contain an 8 byte little endian integer at offset 20
+    # to indicate the actual local header offset.
+    # As of python3.11, python does not handle zip64 central directories
+    # correctly, so we will manually do the parsing here.
 
-    # There isn't any matching files. Don't unzip anything.
-    if not filtered:
-      return
-    cmd.extend(filtered)
+    # ZIP64 central directory extra field has two required fields:
+    # 2 bytes header ID and 2 bytes size field. Thes two require fields have
+    # a total size of 4 bytes. Then it has three other 8 bytes field, followed
+    # by a 4 byte disk number field. The last disk number field is not required
+    # to be present, but if it is present, the total size of extra field will be
+    # divisible by 8(because 2+2+4+8*n is always going to be multiple of 8)
+    # Most extra fields are optional, but when they appear, their must appear
+    # in the order defined by zip64 spec. Since file header offset is the 2nd
+    # to last field in zip64 spec, it will only be at last 8 bytes or last 12-4
+    # bytes, depending on whether disk number is present.
+    for entry in entries:
+      if entry.header_offset == 0xFFFFFFFF:
+        if len(entry.extra) % 8 == 0:
+          entry.header_offset = int.from_bytes(entry.extra[-12:-4], "little")
+        else:
+          entry.header_offset = int.from_bytes(entry.extra[-8:], "little")
+    if patterns is not None:
+      filtered = [info for info in entries if any(
+          [fnmatch.fnmatch(info.filename, p) for p in patterns])]
 
-  RunAndCheckOutput(cmd)
+      # There isn't any matching files. Don't unzip anything.
+      if not filtered:
+        return
+      for info in filtered:
+        UnzipSingleFile(input_zip, info, dirname)
+    else:
+      for info in entries:
+        UnzipSingleFile(input_zip, info, dirname)
 
 
 def UnzipTemp(filename, patterns=None):
@@ -2077,7 +2322,6 @@ def UnzipTemp(filename, patterns=None):
 def GetUserImage(which, tmpdir, input_zip,
                  info_dict=None,
                  allow_shared_blocks=None,
-                 hashtree_info_generator=None,
                  reset_file_map=False):
   """Returns an Image object suitable for passing to BlockImageDiff.
 
@@ -2094,8 +2338,6 @@ def GetUserImage(which, tmpdir, input_zip,
     info_dict: The dict to be looked up for relevant info.
     allow_shared_blocks: If image is sparse, whether having shared blocks is
         allowed. If none, it is looked up from info_dict.
-    hashtree_info_generator: If present and image is sparse, generates the
-        hashtree_info for this sparse image.
     reset_file_map: If true and image is sparse, reset file map before returning
         the image.
   Returns:
@@ -2105,9 +2347,7 @@ def GetUserImage(which, tmpdir, input_zip,
   if info_dict is None:
     info_dict = LoadInfoDict(input_zip)
 
-  is_sparse = info_dict.get("extfs_sparse_flag")
-  if info_dict.get(which + "_disable_sparse"):
-    is_sparse = False
+  is_sparse = IsSparseImage(os.path.join(tmpdir, "IMAGES", which + ".img"))
 
   # When target uses 'BOARD_EXT4_SHARE_DUP_BLOCKS := true', images may contain
   # shared blocks (i.e. some blocks will show up in multiple files' block
@@ -2117,15 +2357,14 @@ def GetUserImage(which, tmpdir, input_zip,
     allow_shared_blocks = info_dict.get("ext4_share_dup_blocks") == "true"
 
   if is_sparse:
-    img = GetSparseImage(which, tmpdir, input_zip, allow_shared_blocks,
-                         hashtree_info_generator)
+    img = GetSparseImage(which, tmpdir, input_zip, allow_shared_blocks)
     if reset_file_map:
       img.ResetFileMap()
     return img
-  return GetNonSparseImage(which, tmpdir, hashtree_info_generator)
+  return GetNonSparseImage(which, tmpdir)
 
 
-def GetNonSparseImage(which, tmpdir, hashtree_info_generator=None):
+def GetNonSparseImage(which, tmpdir):
   """Returns a Image object suitable for passing to BlockImageDiff.
 
   This function loads the specified non-sparse image from the given path.
@@ -2143,11 +2382,10 @@ def GetNonSparseImage(which, tmpdir, hashtree_info_generator=None):
   # ota_from_target_files.py (since LMP).
   assert os.path.exists(path) and os.path.exists(mappath)
 
-  return images.FileImage(path, hashtree_info_generator=hashtree_info_generator)
+  return images.FileImage(path)
 
 
-def GetSparseImage(which, tmpdir, input_zip, allow_shared_blocks,
-                   hashtree_info_generator=None):
+def GetSparseImage(which, tmpdir, input_zip, allow_shared_blocks):
   """Returns a SparseImage object suitable for passing to BlockImageDiff.
 
   This function loads the specified sparse image from the given path, and
@@ -2160,8 +2398,6 @@ def GetSparseImage(which, tmpdir, input_zip, allow_shared_blocks,
     tmpdir: The directory that contains the prebuilt image and block map file.
     input_zip: The target-files ZIP archive.
     allow_shared_blocks: Whether having shared blocks is allowed.
-    hashtree_info_generator: If present, generates the hashtree_info for this
-        sparse image.
   Returns:
     A SparseImage object, with file_map info loaded.
   """
@@ -2178,8 +2414,7 @@ def GetSparseImage(which, tmpdir, input_zip, allow_shared_blocks,
   clobbered_blocks = "0"
 
   image = sparse_img.SparseImage(
-      path, mappath, clobbered_blocks, allow_shared_blocks=allow_shared_blocks,
-      hashtree_info_generator=hashtree_info_generator)
+      path, mappath, clobbered_blocks, allow_shared_blocks=allow_shared_blocks)
 
   # block.map may contain less blocks, because mke2fs may skip allocating blocks
   # if they contain all zeros. We can't reconstruct such a file from its block
@@ -2295,8 +2530,9 @@ def GetMinSdkVersion(apk_name):
             apk_name, proc.returncode, stdoutdata, stderrdata))
 
   for line in stdoutdata.split("\n"):
-    # Looking for lines such as sdkVersion:'23' or sdkVersion:'M'.
-    m = re.match(r'sdkVersion:\'([^\']*)\'', line)
+    # Due to ag/24161708, looking for lines such as minSdkVersion:'23',minSdkVersion:'M'
+    # or sdkVersion:'23', sdkVersion:'M'.
+    m = re.match(r'(?:minSdkVersion|sdkVersion):\'([^\']*)\'', line)
     if m:
       return m.group(1)
   raise ExternalError("No minSdkVersion returned by aapt2")
@@ -2393,8 +2629,8 @@ def SignFile(input_name, output_name, key, password, min_api_level=None,
   stdoutdata, _ = proc.communicate(password)
   if proc.returncode != 0:
     raise ExternalError(
-        "Failed to run signapk.jar: return code {}:\n{}".format(
-            proc.returncode, stdoutdata))
+        "Failed to run {}: return code {}:\n{}".format(cmd,
+                                                       proc.returncode, stdoutdata))
 
 
 def CheckSize(data, target, info_dict):
@@ -2424,7 +2660,9 @@ def CheckSize(data, target, info_dict):
     device = p.device
     if "/" in device:
       device = device[device.rfind("/")+1:]
-    limit = info_dict.get(device + "_size")
+    limit = info_dict.get(device + "_size", 0)
+    if isinstance(limit, str):
+      limit = int(limit, 0)
   if not fs_type or not limit:
     return
 
@@ -2561,12 +2799,19 @@ def Usage(docstring):
 def ParseOptions(argv,
                  docstring,
                  extra_opts="", extra_long_opts=(),
-                 extra_option_handler=None):
+                 extra_option_handler: Iterable[OptionHandler] = None):
   """Parse the options in argv and return any arguments that aren't
   flags.  docstring is the calling module's docstring, to be displayed
   for errors and -h.  extra_opts and extra_long_opts are for flags
   defined by the caller, which are processed by passing them to
   extra_option_handler."""
+  extra_long_opts = list(extra_long_opts)
+  if not isinstance(extra_option_handler, Iterable):
+    extra_option_handler = [extra_option_handler]
+
+  for handler in extra_option_handler:
+    if isinstance(handler, OptionHandler):
+      extra_long_opts.extend(handler.extra_long_opts)
 
   try:
     opts, args = getopt.getopt(
@@ -2609,13 +2854,17 @@ def ParseOptions(argv,
     elif o in ("--private_key_suffix",):
       OPTIONS.private_key_suffix = a
     elif o in ("--boot_signer_path",):
-      OPTIONS.boot_signer_path = a
+      raise ValueError(
+          "--boot_signer_path is no longer supported, please switch to AVB")
     elif o in ("--boot_signer_args",):
-      OPTIONS.boot_signer_args = shlex.split(a)
+      raise ValueError(
+          "--boot_signer_args is no longer supported, please switch to AVB")
     elif o in ("--verity_signer_path",):
-      OPTIONS.verity_signer_path = a
+      raise ValueError(
+          "--verity_signer_path is no longer supported, please switch to AVB")
     elif o in ("--verity_signer_args",):
-      OPTIONS.verity_signer_args = shlex.split(a)
+      raise ValueError(
+          "--verity_signer_args is no longer supported, please switch to AVB")
     elif o in ("-s", "--device_specific"):
       OPTIONS.device_specific = a
     elif o in ("-x", "--extra"):
@@ -2624,8 +2873,19 @@ def ParseOptions(argv,
     elif o in ("--logfile",):
       OPTIONS.logfile = a
     else:
-      if extra_option_handler is None or not extra_option_handler(o, a):
-        assert False, "unknown option \"%s\"" % (o,)
+      if extra_option_handler is None:
+        raise ValueError("unknown option \"%s\"" % (o,))
+      success = False
+      for handler in extra_option_handler:
+        if isinstance(handler, OptionHandler):
+          if handler.handler(o, a):
+            success = True
+            break
+        elif handler(o, a):
+          success = True
+      if not success:
+        raise ValueError("unknown option \"%s\"" % (o,))
+
 
   if OPTIONS.search_path:
     os.environ["PATH"] = (os.path.join(OPTIONS.search_path, "bin") +
@@ -2656,6 +2916,8 @@ def MakeTempDir(prefix='tmp', suffix=''):
 
 def Cleanup():
   for i in OPTIONS.tempfiles:
+    if not os.path.exists(i):
+      continue
     if os.path.isdir(i):
       shutil.rmtree(i, ignore_errors=True)
     else:
@@ -2874,27 +3136,49 @@ def ZipWriteStr(zip_file, zinfo_or_arcname, data, perms=None,
   zip_file.writestr(zinfo, data)
   zipfile.ZIP64_LIMIT = saved_zip64_limit
 
-
-def ZipDelete(zip_filename, entries):
+def ZipExclude(input_zip, output_zip, entries, force=False):
   """Deletes entries from a ZIP file.
-
-  Since deleting entries from a ZIP file is not supported, it shells out to
-  'zip -d'.
 
   Args:
     zip_filename: The name of the ZIP file.
     entries: The name of the entry, or the list of names to be deleted.
+  """
+  if isinstance(entries, str):
+    entries = [entries]
+  # If list is empty, nothing to do
+  if not entries:
+    shutil.copy(input_zip, output_zip)
+    return
 
-  Raises:
-    AssertionError: In case of non-zero return from 'zip'.
+  with zipfile.ZipFile(input_zip, 'r') as zin:
+    if not force and len(set(zin.namelist()).intersection(entries)) == 0:
+      raise ExternalError(
+          "Failed to delete zip entries, name not matched: %s" % entries)
+
+    fd, new_zipfile = tempfile.mkstemp(dir=os.path.dirname(input_zip))
+    os.close(fd)
+    cmd = ["zip2zip", "-i", input_zip, "-o", new_zipfile]
+    for entry in entries:
+      cmd.append("-x")
+      cmd.append(entry)
+    RunAndCheckOutput(cmd)
+  os.replace(new_zipfile, output_zip)
+
+
+def ZipDelete(zip_filename, entries, force=False):
+  """Deletes entries from a ZIP file.
+
+  Args:
+    zip_filename: The name of the ZIP file.
+    entries: The name of the entry, or the list of names to be deleted.
   """
   if isinstance(entries, str):
     entries = [entries]
   # If list is empty, nothing to do
   if not entries:
     return
-  cmd = ["zip", "-d", zip_filename] + entries
-  RunAndCheckOutput(cmd)
+
+  ZipExclude(zip_filename, zip_filename, entries, force)
 
 
 def ZipClose(zip_file):
@@ -3603,12 +3887,11 @@ def MakeRecoveryPatch(input_dir, output_sink, recovery_img, boot_img,
     output_sink(recovery_img_path, recovery_img.data)
 
   else:
-    system_root_image = info_dict.get("system_root_image") == "true"
+    include_recovery_dtbo = info_dict.get("include_recovery_dtbo") == "true"
+    include_recovery_acpio = info_dict.get("include_recovery_acpio") == "true"
     path = os.path.join(input_dir, recovery_resource_dat_path)
-    # With system-root-image, boot and recovery images will have mismatching
-    # entries (only recovery has the ramdisk entry) (Bug: 72731506). Use bsdiff
-    # to handle such a case.
-    if system_root_image:
+    # Use bsdiff to handle mismatching entries (Bug: 72731506)
+    if include_recovery_dtbo or include_recovery_acpio:
       diff_program = ["bsdiff"]
       bonus_args = ""
       assert not os.path.exists(path)
@@ -3919,7 +4202,7 @@ def GetBootImageBuildProp(boot_img, ramdisk_format=RamdiskFormat.LZ4):
   Get build.prop from ramdisk within the boot image
 
   Args:
-    boot_img: the boot image file. Ramdisk must be compressed with lz4 or minigzip format.
+    boot_img: the boot image file. Ramdisk must be compressed with lz4 or gzip format.
 
   Return:
     An extracted file that stores properties in the boot image.
@@ -3938,7 +4221,13 @@ def GetBootImageBuildProp(boot_img, ramdisk_format=RamdiskFormat.LZ4):
     elif ramdisk_format == RamdiskFormat.GZ:
       with open(ramdisk, 'rb') as input_stream:
         with open(uncompressed_ramdisk, 'wb') as output_stream:
-          p2 = Run(['minigzip', '-d'], stdin=input_stream.fileno(),
+          p2 = Run(['gzip', '-d'], stdin=input_stream.fileno(),
+                   stdout=output_stream.fileno())
+          p2.wait()
+    elif ramdisk_format == RamdiskFormat.XZ:
+      with open(ramdisk, 'rb') as input_stream:
+        with open(uncompressed_ramdisk, 'wb') as output_stream:
+          p2 = Run(['xz', '-d'], stdin=input_stream.fileno(),
                    stdout=output_stream.fileno())
           p2.wait()
     elif ramdisk_format == RamdiskFormat.XZ:
@@ -3948,7 +4237,7 @@ def GetBootImageBuildProp(boot_img, ramdisk_format=RamdiskFormat.LZ4):
                    stdout=output_stream.fileno())
           p2.wait()
     else:
-      logger.error('Only support lz4, xz, or minigzip ramdisk format.')
+      logger.error('Only support lz4, xz, or gzip ramdisk format.')
       return None
 
     abs_uncompressed_ramdisk = os.path.abspath(uncompressed_ramdisk)
@@ -4005,134 +4294,45 @@ def GetBootImageTimestamp(boot_img):
     return None
 
 
-def GetCareMap(which, imgname):
-  """Returns the care_map string for the given partition.
-
-  Args:
-    which: The partition name, must be listed in PARTITIONS_WITH_CARE_MAP.
-    imgname: The filename of the image.
-
-  Returns:
-    (which, care_map_ranges): care_map_ranges is the raw string of the care_map
-    RangeSet; or None.
-  """
-  assert which in PARTITIONS_WITH_CARE_MAP
-
-  # which + "_image_size" contains the size that the actual filesystem image
-  # resides in, which is all that needs to be verified. The additional blocks in
-  # the image file contain verity metadata, by reading which would trigger
-  # invalid reads.
-  image_size = OPTIONS.info_dict.get(which + "_image_size")
-  if not image_size:
-    return None
-
-  disable_sparse = OPTIONS.info_dict.get(which + "_disable_sparse")
-
-  image_blocks = int(image_size) // 4096 - 1
-  # It's OK for image_blocks to be 0, because care map ranges are inclusive.
-  # So 0-0 means "just block 0", which is valid.
-  assert image_blocks >= 0, "blocks for {} must be non-negative, image size: {}".format(
-      which, image_size)
-
-  # For sparse images, we will only check the blocks that are listed in the care
-  # map, i.e. the ones with meaningful data.
-  if "extfs_sparse_flag" in OPTIONS.info_dict and not disable_sparse:
-    simg = sparse_img.SparseImage(imgname)
-    care_map_ranges = simg.care_map.intersect(
-        rangelib.RangeSet("0-{}".format(image_blocks)))
-
-  # Otherwise for non-sparse images, we read all the blocks in the filesystem
-  # image.
-  else:
-    care_map_ranges = rangelib.RangeSet("0-{}".format(image_blocks))
-
-  return [which, care_map_ranges.to_string_raw()]
-
-
-def AddCareMapForAbOta(output_file, ab_partitions, image_paths):
-  """Generates and adds care_map.pb for a/b partition that has care_map.
-
-  Args:
-    output_file: The output zip file (needs to be already open),
-        or file path to write care_map.pb.
-    ab_partitions: The list of A/B partitions.
-    image_paths: A map from the partition name to the image path.
-  """
-  if not output_file:
-    raise ExternalError('Expected output_file for AddCareMapForAbOta')
-
-  care_map_list = []
-  for partition in ab_partitions:
-    partition = partition.strip()
-    if partition not in PARTITIONS_WITH_CARE_MAP:
-      continue
-
-    verity_block_device = "{}_verity_block_device".format(partition)
-    avb_hashtree_enable = "avb_{}_hashtree_enable".format(partition)
-    if (verity_block_device in OPTIONS.info_dict or
-            OPTIONS.info_dict.get(avb_hashtree_enable) == "true"):
-      if partition not in image_paths:
-        logger.warning('Potential partition with care_map missing from images: %s',
-                       partition)
-        continue
-      image_path = image_paths[partition]
-      if not os.path.exists(image_path):
-        raise ExternalError('Expected image at path {}'.format(image_path))
-
-      care_map = GetCareMap(partition, image_path)
-      if not care_map:
-        continue
-      care_map_list += care_map
-
-      # adds fingerprint field to the care_map
-      # TODO(xunchang) revisit the fingerprint calculation for care_map.
-      partition_props = OPTIONS.info_dict.get(partition + ".build.prop")
-      prop_name_list = ["ro.{}.build.fingerprint".format(partition),
-                        "ro.{}.build.thumbprint".format(partition)]
-
-      present_props = [x for x in prop_name_list if
-                       partition_props and partition_props.GetProp(x)]
-      if not present_props:
-        logger.warning(
-            "fingerprint is not present for partition %s", partition)
-        property_id, fingerprint = "unknown", "unknown"
-      else:
-        property_id = present_props[0]
-        fingerprint = partition_props.GetProp(property_id)
-      care_map_list += [property_id, fingerprint]
-
-  if not care_map_list:
-    return
-
-  # Converts the list into proto buf message by calling care_map_generator; and
-  # writes the result to a temp file.
-  temp_care_map_text = MakeTempFile(prefix="caremap_text-",
-                                           suffix=".txt")
-  with open(temp_care_map_text, 'w') as text_file:
-    text_file.write('\n'.join(care_map_list))
-
-  temp_care_map = MakeTempFile(prefix="caremap-", suffix=".pb")
-  care_map_gen_cmd = ["care_map_generator", temp_care_map_text, temp_care_map]
-  RunAndCheckOutput(care_map_gen_cmd)
-
-  if not isinstance(output_file, zipfile.ZipFile):
-    shutil.copy(temp_care_map, output_file)
-    return
-  # output_file is a zip file
-  care_map_path = "META/care_map.pb"
-  if care_map_path in output_file.namelist():
-    # Copy the temp file into the OPTIONS.input_tmp dir and update the
-    # replace_updated_files_list used by add_img_to_target_files
-    if not OPTIONS.replace_updated_files_list:
-      OPTIONS.replace_updated_files_list = []
-    shutil.copy(temp_care_map, os.path.join(OPTIONS.input_tmp, care_map_path))
-    OPTIONS.replace_updated_files_list.append(care_map_path)
-  else:
-    ZipWrite(output_file, temp_care_map, arcname=care_map_path)
-
-
 def IsSparseImage(filepath):
+  if not os.path.exists(filepath):
+    return False
   with open(filepath, 'rb') as fp:
     # Magic for android sparse image format
     # https://source.android.com/devices/bootloader/images
     return fp.read(4) == b'\x3A\xFF\x26\xED'
+
+
+def UnsparseImage(filepath, target_path=None):
+  if not IsSparseImage(filepath):
+    return
+  if target_path is None:
+    tmp_img = MakeTempFile(suffix=".img")
+    RunAndCheckOutput(["simg2img", filepath, tmp_img])
+    os.rename(tmp_img, filepath)
+  else:
+    RunAndCheckOutput(["simg2img", filepath, target_path])
+
+
+def ParseUpdateEngineConfig(path: str):
+  """Parse the update_engine config stored in file `path`
+  Args
+    path: Path to update_engine_config.txt file in target_files
+
+  Returns
+    A tuple of (major, minor) version number . E.g. (2, 8)
+  """
+  with open(path, "r") as fp:
+    # update_engine_config.txt is only supposed to contain two lines,
+    # PAYLOAD_MAJOR_VERSION and PAYLOAD_MINOR_VERSION. 1024 should be more than
+    # sufficient. If the length is more than that, something is wrong.
+    data = fp.read(1024)
+    major = re.search(r"PAYLOAD_MAJOR_VERSION=(\d+)", data)
+    if not major:
+      raise ValueError(
+          f"{path} is an invalid update_engine config, missing PAYLOAD_MAJOR_VERSION {data}")
+    minor = re.search(r"PAYLOAD_MINOR_VERSION=(\d+)", data)
+    if not minor:
+      raise ValueError(
+          f"{path} is an invalid update_engine config, missing PAYLOAD_MINOR_VERSION {data}")
+    return (int(major.group(1)), int(minor.group(1)))

@@ -28,7 +28,6 @@ PRODUCT_PACKAGES += \
     DeskClock \
     Gallery2 \
     Music \
-    OneTimeInitializer \
     preinstalled-packages-platform-handheld-product.xml \
     QuickSearchBox \
     SettingsIntelligence \

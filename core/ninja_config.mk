@@ -14,7 +14,6 @@ PARSE_TIME_MAKE_GOALS := \
 	$(PARSE_TIME_MAKE_GOALS) \
 	$(dont_bother_goals) \
 	all \
-	ECLIPSE-% \
 	brillo_tests \
 	btnod \
 	build-art% \
@@ -25,6 +24,7 @@ PARSE_TIME_MAKE_GOALS := \
 	cts \
 	custom_images \
 	dicttool_aosp \
+	docs \
 	eng \
 	oem_image \
 	online-system-api-sdk-docs \

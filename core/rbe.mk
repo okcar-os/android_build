@@ -64,7 +64,7 @@ ifneq ($(filter-out false,$(USE_RBE)),)
     d8_exec_strategy := remote_local_fallback
   endif
 
-  platform := container-image=docker://gcr.io/androidbuild-re-dockerimage/android-build-remoteexec-image@sha256:582efb38f0c229ea39952fff9e132ccbe183e14869b39888010dacf56b360d62
+  platform := container-image=docker://gcr.io/androidbuild-re-dockerimage/android-build-remoteexec-image@sha256:1eb7f64b9e17102b970bd7a1af7daaebdb01c3fb777715899ef462d6c6d01a45
   cxx_platform := $(platform),Pool=$(cxx_pool)
   java_r8_d8_platform := $(platform),Pool=$(java_pool)
 
@@ -81,11 +81,11 @@ ifneq ($(filter-out false,$(USE_RBE)),)
   endif
 
   ifdef RBE_R8
-    R8_WRAPPER := $(strip $(RBE_WRAPPER) --labels=type=compile,compiler=r8 --exec_strategy=$(r8_exec_strategy) --platform=$(java_r8_d8_platform) --inputs=out/soong/host/linux-x86/framework/r8-compat-proguard.jar,build/make/core/proguard_basic_keeps.flags --toolchain_inputs=prebuilts/jdk/jdk11/linux-x86/bin/java)
+    R8_WRAPPER := $(strip $(RBE_WRAPPER) --labels=type=compile,compiler=r8 --exec_strategy=$(r8_exec_strategy) --platform=$(java_r8_d8_platform) --inputs=$(OUT_DIR)/host/linux-x86/framework/r8.jar,build/make/core/proguard_basic_keeps.flags --toolchain_inputs=$(firstword $(JAVA)))
   endif
 
   ifdef RBE_D8
-    D8_WRAPPER := $(strip $(RBE_WRAPPER) --labels=type=compile,compiler=d8 --exec_strategy=$(d8_exec_strategy) --platform=$(java_r8_d8_platform) --inputs=out/soong/host/linux-x86/framework/d8.jar --toolchain_inputs=prebuilts/jdk/jdk11/linux-x86/bin/java)
+    D8_WRAPPER := $(strip $(RBE_WRAPPER) --labels=type=compile,compiler=d8 --exec_strategy=$(d8_exec_strategy) --platform=$(java_r8_d8_platform) --inputs=$(OUT_DIR)/host/linux-x86/framework/d8.jar --toolchain_inputs=$(firstword $(JAVA)))
   endif
 
   rbe_dir :=

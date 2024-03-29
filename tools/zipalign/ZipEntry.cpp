@@ -18,6 +18,8 @@
 // Access to entries in a Zip archive.
 //
 
+#define _POSIX_THREAD_SAFE_FUNCTIONS  // For mingw localtime_r().
+
 #define LOG_TAG "zip"
 
 #include "ZipEntry.h"
@@ -40,14 +42,10 @@ namespace android {
  */
 status_t ZipEntry::initFromCDE(FILE* fp)
 {
-    status_t result;
-    long posn; // NOLINT(google-runtime-int), for ftell/fseek
-    bool hasDD;
-
     //ALOGV("initFromCDE ---\n");
 
     /* read the CDE */
-    result = mCDE.read(fp);
+    status_t result = mCDE.read(fp);
     if (result != OK) {
         ALOGD("mCDE.read failed\n");
         return result;
@@ -56,8 +54,8 @@ status_t ZipEntry::initFromCDE(FILE* fp)
     //mCDE.dump();
 
     /* using the info in the CDE, go load up the LFH */
-    posn = ftell(fp);
-    if (fseek(fp, mCDE.mLocalHeaderRelOffset, SEEK_SET) != 0) {
+    off_t posn = ftello(fp);
+    if (fseeko(fp, mCDE.mLocalHeaderRelOffset, SEEK_SET) != 0) {
         ALOGD("local header seek failed (%" PRIu32 ")\n",
             mCDE.mLocalHeaderRelOffset);
         return UNKNOWN_ERROR;
@@ -69,7 +67,7 @@ status_t ZipEntry::initFromCDE(FILE* fp)
         return result;
     }
 
-    if (fseek(fp, posn, SEEK_SET) != 0)
+    if (fseeko(fp, posn, SEEK_SET) != 0)
         return UNKNOWN_ERROR;
 
     //mLFH.dump();
@@ -80,7 +78,7 @@ status_t ZipEntry::initFromCDE(FILE* fp)
      * compressed size, and uncompressed size will be zero.  In practice
      * these seem to be rare.
      */
-    hasDD = (mLFH.mGPBitFlag & kUsesDataDescr) != 0;
+    bool hasDD = (mLFH.mGPBitFlag & kUsesDataDescr) != 0;
     if (hasDD) {
         // do something clever
         //ALOGD("+++ has data descriptor\n");
@@ -358,31 +356,29 @@ time_t ZipEntry::getModWhen(void) const
  */
 void ZipEntry::setModWhen(time_t when)
 {
-#if !defined(_WIN32)
-    struct tm tmResult;
-#endif
-    time_t even;
-    uint16_t zdate, ztime;
-
-    struct tm* ptm;
-
     /* round up to an even number of seconds */
-    even = (when & 1) ? (when + 1) : when;
+    time_t even = (when & 1) ? (when + 1) : when;
 
     /* expand */
-#if !defined(_WIN32)
-    ptm = localtime_r(&even, &tmResult);
-#else
-    ptm = localtime(&even);
-#endif
+    struct tm tmResult;
+    struct tm* ptm = localtime_r(&even, &tmResult);
 
-    int year;
-    year = ptm->tm_year;
-    if (year < 80)
-        year = 80;
+    // The earliest valid time for ZIP file entries is 1980-01-01. See:
+    // https://users.cs.jmu.edu/buchhofp/forensics/formats/pkzip.html.
+    // Set any time before 1980 to 1980-01-01.
+    if (ptm->tm_year < 80) {
+        ptm->tm_year = 80;
+        ptm->tm_mon = 0;
+        ptm->tm_mday = 1;
+        ptm->tm_hour = 0;
+        ptm->tm_min = 0;
+        ptm->tm_sec = 0;
+    }
 
-    zdate = (year - 80) << 9 | (ptm->tm_mon+1) << 5 | ptm->tm_mday;
-    ztime = ptm->tm_hour << 11 | ptm->tm_min << 5 | ptm->tm_sec >> 1;
+    uint16_t zdate = static_cast<uint16_t>(
+        (ptm->tm_year - 80) << 9 | (ptm->tm_mon + 1) << 5 | ptm->tm_mday);
+    uint16_t ztime = static_cast<uint16_t>(
+        ptm->tm_hour << 11 | ptm->tm_min << 5 | ptm->tm_sec >> 1);
 
     mCDE.mLastModFileTime = mLFH.mLastModFileTime = ztime;
     mCDE.mLastModFileDate = mLFH.mLastModFileDate = zdate;

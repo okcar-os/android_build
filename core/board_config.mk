@@ -144,9 +144,6 @@ _board_strip_list += BOARD_AVB_PVMFW_KEY_PATH
 _board_strip_list += BOARD_AVB_PVMFW_ALGORITHM
 _board_strip_list += BOARD_AVB_PVMFW_ROLLBACK_INDEX_LOCATION
 _board_strip_list += BOARD_PARTIAL_OTA_UPDATE_PARTITIONS_LIST
-_board_strip_list += BOARD_BPT_DISK_SIZE
-_board_strip_list += BOARD_BPT_INPUT_FILES
-_board_strip_list += BOARD_BPT_MAKE_TABLE_ARGS
 _board_strip_list += BOARD_AVB_VBMETA_VENDOR_ROLLBACK_INDEX_LOCATION
 _board_strip_list += BOARD_AVB_VBMETA_VENDOR_ALGORITHM
 _board_strip_list += BOARD_AVB_VBMETA_VENDOR_KEY_PATH
@@ -164,9 +161,6 @@ _board_strip_list += BOARD_AVB_VENDOR_BOOT_ROLLBACK_INDEX_LOCATION
 _board_strip_list += BOARD_AVB_VENDOR_KERNEL_BOOT_KEY_PATH
 _board_strip_list += BOARD_AVB_VENDOR_KERNEL_BOOT_ALGORITHM
 _board_strip_list += BOARD_AVB_VENDOR_KERNEL_BOOT_ROLLBACK_INDEX_LOCATION
-_board_strip_list += BOARD_GKI_SIGNING_SIGNATURE_ARGS
-_board_strip_list += BOARD_GKI_SIGNING_ALGORITHM
-_board_strip_list += BOARD_GKI_SIGNING_KEY_PATH
 _board_strip_list += BOARD_MKBOOTIMG_ARGS
 _board_strip_list += BOARD_VENDOR_BOOTIMAGE_PARTITION_SIZE
 _board_strip_list += BOARD_VENDOR_KERNEL_BOOTIMAGE_PARTITION_SIZE
@@ -174,6 +168,10 @@ _board_strip_list += ODM_MANIFEST_SKUS
 
 
 _build_broken_var_list := \
+  BUILD_BROKEN_CLANG_PROPERTY \
+  BUILD_BROKEN_CLANG_ASFLAGS \
+  BUILD_BROKEN_CLANG_CFLAGS \
+  BUILD_BROKEN_DEPFILE \
   BUILD_BROKEN_DUP_RULES \
   BUILD_BROKEN_DUP_SYSPROP \
   BUILD_BROKEN_ELF_PREBUILT_PRODUCT_COPY_FILES \
@@ -186,6 +184,8 @@ _build_broken_var_list := \
   BUILD_BROKEN_USES_NETWORK \
   BUILD_BROKEN_VENDOR_PROPERTY_NAMESPACE \
   BUILD_BROKEN_VINTF_PRODUCT_COPY_FILES \
+  BUILD_BROKEN_INCORRECT_PARTITION_IMAGES \
+  BUILD_BROKEN_GENRULE_SANDBOXING \
 
 _build_broken_var_list += \
   $(foreach m,$(AVAILABLE_BUILD_MODULE_TYPES) \
@@ -199,7 +199,7 @@ _board_strip_readonly_list += $(_build_broken_var_list) \
 
 # Conditional to building on linux, as dex2oat currently does not work on darwin.
 ifeq ($(HOST_OS),linux)
-  WITH_DEXPREOPT := true
+  WITH_DEXPREOPT ?= true
 endif
 
 # ###############################################################
@@ -221,6 +221,8 @@ else
   board_config_mk := \
     $(strip $(sort $(wildcard \
       $(SRC_TARGET_DIR)/board/$(TARGET_DEVICE)/BoardConfig.mk \
+      device/generic/goldfish/board/$(TARGET_DEVICE)/BoardConfig.mk \
+      device/google/cuttlefish/board/$(TARGET_DEVICE)/BoardConfig.mk \
       $(shell test -d device && find -L device -maxdepth 4 -path '*/$(TARGET_DEVICE)/BoardConfig.mk') \
       $(shell test -d vendor && find -L vendor -maxdepth 4 -path '*/$(TARGET_DEVICE)/BoardConfig.mk') \
     )))
@@ -234,10 +236,7 @@ else
   .KATI_READONLY := TARGET_DEVICE_DIR
 endif
 
-# TODO(colefaust) change this if to RBC_PRODUCT_CONFIG when
-# the board configuration is known to work on everything
-# the product config works on.
-ifndef RBC_BOARD_CONFIG
+ifndef RBC_PRODUCT_CONFIG
 include $(board_config_mk)
 -include okcar/after_device_include.mk
 else
@@ -255,7 +254,7 @@ else
   endif
 
   $(shell build/soong/scripts/update_out $(OUT_DIR)/rbc/rbc_board_config_results.mk \
-    $(OUT_DIR)/rbcrun RBC_OUT="make" $(OUT_DIR)/rbc/boardlauncher.rbc)
+    $(OUT_DIR)/rbcrun --mode=rbc $(OUT_DIR)/rbc/boardlauncher.rbc)
   ifneq ($(.SHELLSTATUS),0)
     $(error board configuration runner failed: $(.SHELLSTATUS))
   endif
@@ -285,6 +284,8 @@ $(foreach var,$(_board_strip_list),$(eval $(var) := $$(strip $$($(var)))))
 $(foreach var,$(_board_true_false_vars), \
   $(if $(filter-out true false,$($(var))), \
     $(error Valid values of $(var) are "true", "false", and "". Not "$($(var))")))
+
+include $(BUILD_SYSTEM)/board_config_wifi.mk
 
 # Default *_CPU_VARIANT_RUNTIME to CPU_VARIANT if unspecified.
 TARGET_CPU_VARIANT_RUNTIME := $(or $(TARGET_CPU_VARIANT_RUNTIME),$(TARGET_CPU_VARIANT))
@@ -401,12 +402,6 @@ define check_image_config
   $(eval _uc_name :=) \
   $(eval _lc_name :=)
 endef
-
-###########################################
-# Now we can substitute with the real value of TARGET_COPY_OUT_RAMDISK
-ifeq ($(BOARD_BUILD_SYSTEM_ROOT_IMAGE),true)
-TARGET_COPY_OUT_RAMDISK := $(TARGET_COPY_OUT_ROOT)
-endif
 
 ###########################################
 # Configure whether we're building the system image
@@ -557,15 +552,8 @@ endif
 
 # Are we building a debug vendor_boot image
 BUILDING_DEBUG_VENDOR_BOOT_IMAGE :=
-# Can't build vendor_boot-debug.img if BOARD_BUILD_SYSTEM_ROOT_IMAGE is true,
-# because building debug vendor_boot image requires a ramdisk.
-ifeq ($(BOARD_BUILD_SYSTEM_ROOT_IMAGE),true)
-  ifeq ($(PRODUCT_BUILD_DEBUG_VENDOR_BOOT_IMAGE),true)
-    $(warning PRODUCT_BUILD_DEBUG_VENDOR_BOOT_IMAGE is true, but so is BOARD_BUILD_SYSTEM_ROOT_IMAGE. \
-      Skip building the debug vendor_boot image.)
-  endif
 # Can't build vendor_boot-debug.img if we're not building a ramdisk.
-else ifndef BUILDING_RAMDISK_IMAGE
+ifndef BUILDING_RAMDISK_IMAGE
   ifeq ($(PRODUCT_BUILD_DEBUG_VENDOR_BOOT_IMAGE),true)
     $(warning PRODUCT_BUILD_DEBUG_VENDOR_BOOT_IMAGE is true, but we're not building a ramdisk image. \
       Skip building the debug vendor_boot image.)
@@ -602,15 +590,8 @@ endif
 
 # Are we building a debug boot image
 BUILDING_DEBUG_BOOT_IMAGE :=
-# Can't build boot-debug.img if BOARD_BUILD_SYSTEM_ROOT_IMAGE is true,
-# because building debug boot image requires a ramdisk.
-ifeq ($(BOARD_BUILD_SYSTEM_ROOT_IMAGE),true)
-  ifeq ($(PRODUCT_BUILD_DEBUG_BOOT_IMAGE),true)
-    $(warning PRODUCT_BUILD_DEBUG_BOOT_IMAGE is true, but so is BOARD_BUILD_SYSTEM_ROOT_IMAGE. \
-      Skip building the debug boot image.)
-  endif
 # Can't build boot-debug.img if we're not building a ramdisk.
-else ifndef BUILDING_RAMDISK_IMAGE
+ifndef BUILDING_RAMDISK_IMAGE
   ifeq ($(PRODUCT_BUILD_DEBUG_BOOT_IMAGE),true)
     $(warning PRODUCT_BUILD_DEBUG_BOOT_IMAGE is true, but we're not building a ramdisk image. \
       Skip building the debug boot image.)
@@ -931,22 +912,10 @@ endif
 .KATI_READONLY := BUILDING_SYSTEM_DLKM_IMAGE
 
 BOARD_USES_PVMFWIMAGE :=
-ifdef BOARD_PREBUILT_PVMFWIMAGE
-  BOARD_USES_PVMFWIMAGE := true
-endif
 ifeq ($(PRODUCT_BUILD_PVMFW_IMAGE),true)
   BOARD_USES_PVMFWIMAGE := true
 endif
 .KATI_READONLY := BOARD_USES_PVMFWIMAGE
-
-BUILDING_PVMFW_IMAGE :=
-ifeq ($(PRODUCT_BUILD_PVMFW_IMAGE),true)
-  BUILDING_PVMFW_IMAGE := true
-endif
-ifdef BOARD_PREBUILT_PVMFWIMAGE
-  BUILDING_PVMFW_IMAGE :=
-endif
-.KATI_READONLY := BUILDING_PVMFW_IMAGE
 
 ###########################################
 # Ensure consistency among TARGET_RECOVERY_UPDATER_LIBS, AB_OTA_UPDATER, and PRODUCT_OTA_FORCE_NON_AB_PACKAGE.
@@ -977,6 +946,11 @@ ifneq ($(TARGET_OTA_ALLOW_NON_AB),true)
   endif
 endif
 
+# For Non A/B full OTA, disable brotli compression.
+ifeq ($(TARGET_OTA_ALLOW_NON_AB),true)
+  BOARD_NON_AB_OTA_DISABLE_COMPRESSION := true
+endif
+
 # Quick check for building generic OTA packages. Currently it only supports A/B OTAs.
 ifeq ($(PRODUCT_BUILD_GENERIC_OTA_PACKAGE),true)
   ifneq ($(AB_OTA_UPDATER),true)
@@ -996,43 +970,13 @@ define check_vndk_version
   $(if $(wildcard $(vndk_path)/*/Android.bp),,$(error VNDK version $(1) not found))
 endef
 
-ifdef BOARD_VNDK_VERSION
-  ifeq ($(BOARD_VNDK_VERSION),$(PLATFORM_VNDK_VERSION))
-    $(error BOARD_VNDK_VERSION is equal to PLATFORM_VNDK_VERSION; use BOARD_VNDK_VERSION := current)
-  endif
-  ifneq ($(BOARD_VNDK_VERSION),current)
-    $(call check_vndk_version,$(BOARD_VNDK_VERSION))
-  endif
-  TARGET_VENDOR_TEST_SUFFIX := /vendor
-else
-  TARGET_VENDOR_TEST_SUFFIX :=
+ifeq ($(BOARD_VNDK_VERSION),$(PLATFORM_VNDK_VERSION))
+  $(error BOARD_VNDK_VERSION is equal to PLATFORM_VNDK_VERSION; use BOARD_VNDK_VERSION := current)
 endif
-
-# If PRODUCT_ENFORCE_INTER_PARTITION_JAVA_SDK_LIBRARY is set,
-# BOARD_VNDK_VERSION must be set because PRODUCT_ENFORCE_INTER_PARTITION_JAVA_SDK_LIBRARY
-# is a enforcement of inter-partition dependency, and it doesn't have any meaning
-# when BOARD_VNDK_VERSION isn't set.
-ifeq ($(PRODUCT_ENFORCE_INTER_PARTITION_JAVA_SDK_LIBRARY),true)
-  ifeq ($(BOARD_VNDK_VERSION),)
-    $(error BOARD_VNDK_VERSION must be set when PRODUCT_ENFORCE_INTER_PARTITION_JAVA_SDK_LIBRARY is true)
-  endif
+ifneq ($(BOARD_VNDK_VERSION),current)
+  $(call check_vndk_version,$(BOARD_VNDK_VERSION))
 endif
-
-###########################################
-# APEXes are by default flattened, i.e. non-updatable, if not building unbundled
-# apps. It can be unflattened (and updatable) by inheriting from
-# updatable_apex.mk
-#
-# APEX flattening can also be forcibly enabled (resp. disabled) by
-# setting OVERRIDE_TARGET_FLATTEN_APEX to true (resp. false), e.g. by
-# setting the OVERRIDE_TARGET_FLATTEN_APEX environment variable.
-ifdef OVERRIDE_TARGET_FLATTEN_APEX
-  TARGET_FLATTEN_APEX := $(OVERRIDE_TARGET_FLATTEN_APEX)
-else
-  ifeq (,$(TARGET_BUILD_APPS)$(TARGET_FLATTEN_APEX))
-    TARGET_FLATTEN_APEX := true
-  endif
-endif
+TARGET_VENDOR_TEST_SUFFIX := /vendor
 
 ifeq (,$(TARGET_BUILD_UNBUNDLED))
 ifdef PRODUCT_EXTRA_VNDK_VERSIONS
@@ -1045,6 +989,21 @@ _unsupported_systemsdk_versions := $(filter-out $(PLATFORM_SYSTEMSDK_VERSIONS),$
 ifneq (,$(_unsupported_systemsdk_versions))
   $(error System SDK versions '$(_unsupported_systemsdk_versions)' in BOARD_SYSTEMSDK_VERSIONS are not supported.\
           Supported versions are $(PLATFORM_SYSTEMSDK_VERSIONS))
+endif
+
+###########################################
+# BOARD_API_LEVEL for vendor API surface
+ifdef RELEASE_BOARD_API_LEVEL
+  ifdef BOARD_API_LEVEL
+    $(error BOARD_API_LEVEL must not set manully. The build system automatically sets this value.)
+  endif
+  BOARD_API_LEVEL := $(RELEASE_BOARD_API_LEVEL)
+  .KATI_READONLY := BOARD_API_LEVEL
+
+  ifdef RELEASE_BOARD_API_LEVEL_FROZEN
+    BOARD_API_LEVEL_FROZEN := true
+    .KATI_READONLY := BOARD_API_LEVEL_FROZEN
+  endif
 endif
 
 ###########################################
